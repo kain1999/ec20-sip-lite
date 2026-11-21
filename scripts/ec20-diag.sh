@@ -5,9 +5,19 @@ set -u
 
 AT="${EC20_AT:-/dev/ec20-at}"
 [ -e "$AT" ] || AT="/dev/ttyUSB2"
+SERVICE_ACTIVE=0
+systemctl is-active --quiet ec20-sip 2>/dev/null && SERVICE_ACTIVE=1
 
 section() { printf '\n=== %s ===\n' "$*"; }
-at() { printf '%s\r' "$1" > "$AT" 2>/dev/null; sleep 0.7; timeout 1 cat < "$AT" 2>/dev/null | tr -d '\r'; }
+at() {
+    # the daemon owns the AT port exclusively: only probe when it is stopped
+    if [ "$SERVICE_ACTIVE" = "1" ]; then
+        return 0
+    fi
+    printf '%s\r' "$1" > "$AT" 2>/dev/null
+    sleep 0.7
+    timeout 1 cat < "$AT" 2>/dev/null | tr -d '\r'
+}
 
 section "service"
 systemctl is-active ec20-sip 2>/dev/null || echo "inactive"
@@ -33,22 +43,32 @@ grep -i -A1 'EC20\|USB-Audio' /proc/asound/cards 2>/dev/null || echo "no UAC car
 arecord -l 2>/dev/null | head -6
 
 section "AT identity"
-at 'AT'
-at 'ATI'
-at 'AT+CPIN?'
-at 'AT+CSQ'
-at 'AT+CREG?'
-at 'AT+COPS?'
+if [ "$SERVICE_ACTIVE" = "1" ]; then
+    echo "service is running (owns $AT); modem state comes from the panel API:"
+    curl -s -m 5 http://127.0.0.1:8080/api/status 2>/dev/null | tr ',' '\n' | grep -E '"(present|model|imei|iccid|sim_state|signal_dbm|reg_status|operator|ims|voice_ready)"' | sed 's/^/  /'
+    echo "  (stop the service to probe AT directly: systemctl stop ec20-sip)"
+else
+    at 'AT'
+    at 'ATI'
+    at 'AT+CPIN?'
+    at 'AT+CSQ'
+    at 'AT+CREG?'
+    at 'AT+COPS?'
+fi
 
 section "voice / SMS capability"
-at 'AT+QPCMV=?'
-at 'AT+QAUDMOD?'
-at 'AT+QCFG="ims"'
-at 'AT+CIREG?'
-at 'AT+CMGF?'
-at 'AT+CPMS?'
-at 'AT+CSMS?'
-at 'AT+CSCA?'
+if [ "$SERVICE_ACTIVE" = "0" ]; then
+    at 'AT+QPCMV=?'
+    at 'AT+QAUDMOD?'
+    at 'AT+QCFG="ims"'
+    at 'AT+CIREG?'
+    at 'AT+CMGF?'
+    at 'AT+CPMS?'
+    at 'AT+CSMS?'
+    at 'AT+CSCA?'
+else
+    echo "skipped (service running)"
+fi
 
 section "audio self-test (1 s capture)"
 if [ -e /dev/ec20-at ] && arecord -l >/dev/null 2>&1; then

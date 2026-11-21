@@ -38,6 +38,25 @@ class AppContext:
         self.sessions = {}
         self.started = time.time()
         self.sim = False
+        self._sync_settings_from_config()
+
+    def _sync_settings_from_config(self):
+        """First boot: seed the editable settings with values from config.json."""
+        sip_cfg = {
+            "realm": self.config.get("sip.realm"),
+            "external_ip": self.config.get("sip.external_ip"),
+            "port": self.config.get("sip.port"),
+        }
+        current = dict(self.db.get_setting("sip", {}) or {})
+        updated = {k: v for k, v in sip_cfg.items() if v not in (None, "", 0) and not current.get(k)}
+        if updated:
+            current.update(updated)
+            self.db.set_setting("sip", current)
+        dial = dict(self.db.get_setting("dial", {}) or {})
+        prefix = self.config.get("ec20.voice_prefix")
+        if prefix and not dial.get("voice_prefix"):
+            dial["voice_prefix"] = str(prefix)
+            self.db.set_setting("dial", dial)
 
     # ---------------------------------------------------------------- helpers
     def call(self, coro, timeout=15.0):
