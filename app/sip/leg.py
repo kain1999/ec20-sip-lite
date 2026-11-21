@@ -62,17 +62,17 @@ class SipLeg:
                 LOG.exception("dtmf handler failed")
 
     # ------------------------------------------------------------------- UAS
-    async def accept(self, request, addr):
+    async def accept(self, request, peer):
         """Incoming INVITE: remember the transaction and open our media port."""
         self.invite_msg = request
         self.call_id = request.call_id
         self.remote_tag = request.from_tag
-        self.remote_target = addr
+        self.remote_target = peer
         self.remote_sdp = sdp.parse_sdp(request.body)
         self.state = "invited"
         await self.media.open()
         self.server.send_message(sipmsg.build_response(request, 100, "Trying",
-                                                       to_tag=self.local_tag), addr)
+                                                       to_tag=self.local_tag), peer)
         return True
 
     def try_tag(self):
@@ -159,7 +159,7 @@ class SipLeg:
     async def invite(self, target_user, host, port, from_user="box", display="EC20 Gateway"):
         self.call_id = "%s@%s" % (secrets.token_hex(8), self.server.media_ip)
         self.state = "inviting"
-        self.remote_target = (host, int(port or 5060))
+        self.remote_target = await self.server.outbound_peer(target_user, host, int(port or 5060))
         await self.media.open()
         body = sdp.build_sdp(self.server.media_ip, self.media.port, seed=self.call_id)
         contact = "<sip:%s@%s:%d>" % (from_user, self.server.media_ip, self.server.port)
@@ -256,13 +256,14 @@ class SipLeg:
             LOG.exception("bye handler failed")
 
     def send_bye(self):
-        if self.state not in ("answered", "ringing-remote", "inviting", "ringing"):
-            return
+        """Tear the dialog down from our side, regardless of which role we have."""
         if self.state in ("inviting", "ringing-remote"):
             self.cancel()
             return
+        if self.state not in ("answered", "answered-acked"):
+            return
         if self.role == "uas":
-            # we are the UAS: reply-side teardown is driven by the peer's BYE
+            self._send_bye_as_uas()
             return
         if self.pending_request is None:
             return
@@ -278,7 +279,53 @@ class SipLeg:
             ("Content-Length", "0"),
         ])
         self.server.send_message(bye, self.remote_target)
+        self._retransmit_until_gone(bye)
         self.state = "terminated"
+
+    def _send_bye_as_uas(self):
+        """We received the INVITE, so our tag sits in To of the 200 OK we sent.
+
+        Building the BYE by hand is required: without it the other party keeps
+        the call up until its own timeout whenever *we* end the conversation
+        (callee hangs up, EC20 far end clears, panel hangup...).
+        """
+        if self.invite_msg is None or self.remote_target is None:
+            return
+        remote_from = self.invite_msg.get("From") or ""
+        target_uri = sipmsg.strip_params(remote_from).strip()
+        if target_uri.startswith("<") and target_uri.endswith(">"):
+            target_uri = target_uri[1:-1].strip()
+        if not target_uri.lower().startswith("sip"):
+            target_uri = "sip:" + target_uri
+        to_value = sipmsg.strip_params(remote_from).strip()
+        if self.remote_tag and "tag=" not in to_value:
+            to_value = "%s;tag=%s" % (to_value, self.remote_tag)
+        self.local_cseq += 1
+        bye = sipmsg.build_request("BYE", target_uri, headers=[
+            ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (self.server.media_ip, self.server.port, branch())),
+            ("Max-Forwards", "70"),
+            ("From", "<sip:%s@%s>;tag=%s" % (self.user or "box", self.server.media_ip,
+                                             self.local_tag)),
+            ("To", to_value),
+            ("Call-ID", self.call_id),
+            ("CSeq", "%d BYE" % self.local_cseq),
+            ("Content-Length", "0"),
+        ])
+        LOG.info("sending BYE to %s (uas side, call %s)", target_uri, self.call_id)
+        self.server.send_message(bye, self.remote_target)
+        self._retransmit_until_gone(bye)
+        self.state = "terminated"
+
+    def _retransmit_until_gone(self, request):
+        """Repeat the BYE a couple of times; a duplicate gets 481 and is ignored."""
+
+        async def _run():
+            for delay in (0.6, 1.2):
+                await asyncio.sleep(delay)
+                self.server.send_message(request, self.remote_target)
+
+        task = self.server.loop.create_task(_run())
+        self._retransmit_task = task
 
     def cancel(self):
         if not self.pending_request:

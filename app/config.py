@@ -19,6 +19,10 @@ DEFAULTS = {
     "sip": {
         "bind": "0.0.0.0",
         "port": 5060,
+        # SIP over TCP is the default: one connection per phone, so the server
+        # can call the phone back (works behind frp/NAT). Set true only for
+        # phones that cannot do SIP over TCP.
+        "enable_udp": False,
         "realm": "ec20sip.local",
         "external_ip": "",
         # RTP media ports. Leave empty to use ephemeral ports (LAN only).

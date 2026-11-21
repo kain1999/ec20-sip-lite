@@ -9,7 +9,7 @@ import socket
 import time
 
 from .. import media
-from ..sip import digest, message as sipmsg, sdp
+from ..sip import digest, message as sipmsg, sdp, transport
 from ..sip.leg import SipLeg
 from ..util import norm_number, ts_str
 
@@ -30,6 +30,22 @@ def local_ip():
         return ip
     except OSError:
         return "127.0.0.1"
+
+
+def _is_private(ip):
+    if not ip:
+        return False
+    if ip.startswith(("10.", "127.", "169.254.")):
+        return True
+    if ip.startswith("192.168."):
+        return True
+    if ip.startswith("172."):
+        try:
+            second = int(ip.split(".")[1])
+        except (IndexError, ValueError):
+            return False
+        return 16 <= second <= 31
+    return False
 
 
 class UdpProtocol(asyncio.DatagramProtocol):
@@ -74,33 +90,33 @@ class Registrar:
                 out[number] = self.contact(number)
         return out
 
-    def handle(self, message, addr):
+    def handle(self, message, peer):
         server = self.server
         to_user = sipmsg.parse_uri(message.get("To") or "")[0]
         from_user = sipmsg.parse_uri(message.get("From") or "")[0]
         number = to_user or from_user or sipmsg.parse_uri(message.uri or "")[0]
         if not number:
-            server.send_message(sipmsg.build_response(message, 400, "Bad Request"), addr)
+            server.send_message(sipmsg.build_response(message, 400, "Bad Request"), peer)
             return
         extension = self.db.get_extension(number)
         if not extension:
             LOG.warning("REGISTER rejected 403: unknown extension %r (raw To=%r From=%r from %s)",
-                        number, message.get("To"), message.get("From"), addr[0])
-            server.send_message(sipmsg.build_response(message, 403, "Forbidden"), addr)
+                        number, message.get("To"), message.get("From"), peer.ip)
+            server.send_message(sipmsg.build_response(message, 403, "Forbidden"), peer)
             return
         if not int(extension.get("enabled", 1)):
             LOG.warning("REGISTER rejected 403: extension %s is disabled", number)
-            server.send_message(sipmsg.build_response(message, 403, "Forbidden"), addr)
+            server.send_message(sipmsg.build_response(message, 403, "Forbidden"), peer)
             return
         if not message.get("Authorization"):
             server.send_message(sipmsg.build_response(message, 401, "Unauthorized", headers=[
-                ("WWW-Authenticate", server.auth.challenge())]), addr)
+                ("WWW-Authenticate", server.auth.challenge())]), peer)
             return
         ok, reason = server.auth.verify(message, extension["password"])
         if not ok:
             LOG.info("REGISTER auth failed for %s: %s", number, reason)
             server.send_message(sipmsg.build_response(message, 401, "Unauthorized", headers=[
-                ("WWW-Authenticate", server.auth.challenge(stale=(reason == "stale nonce")))]), addr)
+                ("WWW-Authenticate", server.auth.challenge(stale=(reason == "stale nonce")))]), peer)
             return
 
         contact_header = message.get("Contact") or ""
@@ -113,10 +129,11 @@ class Registrar:
             expires = int(match.group(1))
         if expires <= 0:
             self.db.remove_registration(number)
+            server.peer_by_user.pop(number, None)
             LOG.info("unregistered %s", number)
             server.send_message(sipmsg.build_response(message, 200, "OK", headers=[
                 ("Contact", contact_header or "<sip:%s@%s>" % (number, server.media_ip)),
-                ("Expires", "0")]), addr)
+                ("Expires", "0")]), peer)
             return
         default_port = server.config.get("sip.port", 5060)
         contact_match = CONTACT_RE.search(contact_header)
@@ -125,16 +142,19 @@ class Registrar:
             host = contact_match.group(2)
             port = int(contact_match.group(3) or default_port)
         if not host or host in ("0.0.0.0", "::"):
-            host, port = addr[0], addr[1] or default_port
-        contact_uri = "<sip:%s@%s:%d;transport=udp>" % (number, host, port)
+            host, port = peer.ip, peer.port or default_port
+        contact_uri = "<sip:%s@%s:%d;transport=%s>" % (number, host, port, peer.kind)
         self.db.upsert_registration(number, contact_uri, expires,
                                     user_agent=message.get("User-Agent", ""),
-                                    transport="udp", call_id=message.call_id, source_ip=addr[0])
-        LOG.info("registered %s at %s:%s (expires %ss)", number, host, port, expires)
+                                    transport=peer.kind, call_id=message.call_id,
+                                    source_ip=peer.ip)
+        server.bind_user_peer(number, peer, expires)
+        LOG.info("registered %s at %s:%s via %s (expires %ss)", number, host, port,
+                 peer.kind, expires)
         server.send_message(sipmsg.build_response(message, 200, "OK", headers=[
             ("Contact", contact_uri),
             ("Expires", str(expires)),
-            ("Allow", ALLOW)]), addr)
+            ("Allow", ALLOW)]), peer)
 
 
 class SipCall:
@@ -306,10 +326,21 @@ class SipCall:
         if self.modem_port:
             loop.create_task(self.modem_port.stop())
             self.modem_port = None
+        # still-ringing group members must be cancelled, not just dropped
+        for leg in self.ring_legs:
+            if leg.state in ("inviting", "ringing-remote"):
+                try:
+                    leg.cancel()
+                except Exception:  # pragma: no cover
+                    LOG.debug("cancel failed", exc_info=True)
+            leg.close()
         for leg in (self.leg_a, self.leg_b):
             if leg:
-                if leg.state in ("answered", "answered-acked"):
-                    leg.send_bye()
+                if leg.state in ("answered", "answered-acked", "invited", "ringing"):
+                    if leg.state in ("invited", "ringing"):
+                        leg.reject(487, "Request Terminated")
+                    else:
+                        leg.send_bye()
                 leg.close()
         duration = int(time.time() - (self.answered_at or self.started))
         self.manager.server.db.finish_cdr(self.cdr_id, "answered" if self.answered_at else reason or "missed",
@@ -344,7 +375,7 @@ class CallManager:
         return None
 
     def is_modem_call(self, call):
-        return call.modem_id is not None or self.server.modem is not None and call.direction == "in"
+        return call.modem_id is not None
 
     async def modem_hangup(self):
         if self.server.modem:
@@ -364,24 +395,24 @@ class CallManager:
         call.modem_port = port
 
     # ------------------------------------------------------------- incoming
-    def on_invite(self, message, addr):
+    def on_invite(self, message, peer):
         from_user = sipmsg.parse_uri(message.get("From"))[0]
         to_user = sipmsg.parse_uri(message.get("To"))[0] or sipmsg.parse_uri(message.uri)[0]
         extension = self.server.db.get_extension(from_user) if from_user else None
         if not extension or not int(extension.get("enabled", 1)):
-            self.server.send_message(sipmsg.build_response(message, 403, "Forbidden"), addr)
+            self.server.send_message(sipmsg.build_response(message, 403, "Forbidden"), peer)
             return
         if not to_user:
-            self.server.send_message(sipmsg.build_response(message, 404, "Not Found"), addr)
+            self.server.send_message(sipmsg.build_response(message, 404, "Not Found"), peer)
             return
         call = SipCall(self, "in", from_user, to_user)
         self.calls[call.id] = call
         leg = SipLeg(self.server, call, "uas", user=from_user)
         call.leg_a = leg
-        self.server.loop.create_task(self._setup_invite(call, leg, message, addr, to_user))
+        self.server.loop.create_task(self._setup_invite(call, leg, message, peer, to_user))
 
-    async def _setup_invite(self, call, leg, message, addr, target):
-        await leg.accept(message, addr)
+    async def _setup_invite(self, call, leg, message, peer, target):
+        await leg.accept(message, peer)
         self.server.legs[leg.call_id] = leg
         prefix = str(self.server.config.get("ec20.voice_prefix", "9") or "")
         extension = self.server.db.get_extension(target)
@@ -423,7 +454,7 @@ class CallManager:
         call.leg_a.ringing()
         LOG.info("ring group %s -> %s", call.from_user, ",".join(numbers))
 
-    async def _call_extension(self, call, target, contact, addr):
+    async def _call_extension(self, call, target, contact, peer):
         host, port = contact
         leg_b = SipLeg(self.server, call, "uac", user=target)
         call.leg_b = leg_b
@@ -476,10 +507,21 @@ class CallManager:
             return
         if event == "ended":
             for call in list(self.calls.values()):
-                if call.modem_id == modem_call.id:
-                    if call.leg_a and call.leg_a.state in ("invited", "ringing", "answered", "answered-acked"):
-                        call.leg_a.send_bye()
-                    call.end("modem ended")
+                if call.modem_id != modem_call.id:
+                    continue
+                leg = call.leg_a
+                if leg is not None:
+                    if leg.state in ("invited", "ringing"):
+                        # modem call died before the extension answered
+                        leg.reject(486 if modem_call.state == "ended" else 480,
+                                   "Temporarily Unavailable")
+                    elif leg.state in ("answered", "answered-acked"):
+                        leg.send_bye()
+                for other in call.ring_legs:
+                    if other.state in ("inviting", "ringing-remote"):
+                        other.cancel()
+                call.end("modem ended")
+                LOG.info("modem hangup released call %s", call.id)
 
     async def _attach_audio(self, call):
         await self.start_modem_audio(call)
@@ -578,7 +620,9 @@ class SipServer:
         self.db = db
         self.modem = modem
         self.transport = None
-        self.media_ip = config.get("sip.external_ip") or local_ip()
+        self.local_ip = local_ip()
+        self.external_ip = config.get("sip.external_ip") or ""
+        self.media_ip = self.external_ip or self.local_ip
         self.bind = config.get("sip.bind", "0.0.0.0")
         self.port = int(config.get("sip.port", 5060))
         self.auth = digest.DigestAuth(config.get("sip.realm", "ec20sip.local"))
@@ -587,15 +631,22 @@ class SipServer:
         self.calls = CallManager(self)
         self.legs = {}
         self.dialogs = {}
+        self._peers = set()
+        self.peer_by_user = {}
+        self.tcp_listener = None
         self.started = time.time()
         self.sim_audio = False
 
     # ------------------------------------------------------------------ life
     async def start(self):
-        await self.loop.create_datagram_endpoint(lambda: UdpProtocol(self),
-                                                 local_addr=(self.bind, self.port))
-        sockname = self.transport.get_extra_info("sockname")
-        LOG.info("SIP listening on %s:%s (advertising %s)", sockname[0], sockname[1], self.media_ip)
+        self.tcp_listener = transport.TcpListener(self, self.bind, self.port)
+        await self.tcp_listener.start()
+        if self.config.get("sip.enable_udp", False):
+            await self.loop.create_datagram_endpoint(lambda: UdpProtocol(self),
+                                                     local_addr=(self.bind, self.port))
+            LOG.info("SIP/UDP also enabled on %s:%s", self.bind, self.port)
+        LOG.info("SIP listening on %s:%s via TCP (advertising %s)", self.bind, self.port,
+                 self.media_ip)
         return True
 
     async def stop(self):
@@ -604,9 +655,30 @@ class SipServer:
         for leg in list(self.legs.values()):
             leg.close()
         self.legs.clear()
+        if self.tcp_listener:
+            await self.tcp_listener.stop()
+            self.tcp_listener = None
+        for peer in list(self._peers):
+            peer.close()
+        self._peers.clear()
         if self.transport:
             self.transport.close()
             self.transport = None
+
+    def media_ip_for(self, peer_ip):
+        """Address to advertise in SDP for a given peer.
+
+        With frp/NAT configured, `media_ip` is the public address. A LAN phone
+        must still be told the LAN address, otherwise its RTP leaves the local
+        network and comes back through the tunnel (latency, sometimes one-way).
+        """
+        if not self.external_ip or not self.local_ip:
+            return self.media_ip
+        if self.local_ip == self.media_ip:
+            return self.media_ip
+        if _is_private(peer_ip):
+            return self.local_ip
+        return self.media_ip
 
     def make_audio(self):
         from ..ec20.audio import AlsaAudio, ToneAudio, detect_device
@@ -623,13 +695,46 @@ class SipServer:
         return audio
 
     # ------------------------------------------------------------------ send
-    def send_message(self, message, addr):
-        if not self.transport or not addr:
+    def send_message(self, message, peer):
+        """Send to a transport.Peer (or a bare (ip, port) tuple for UDP)."""
+        if not peer:
             return
-        try:
-            self.transport.sendto(message.to_bytes(), addr)
-        except OSError as exc:  # pragma: no cover
-            LOG.debug("send to %s failed: %s", addr, exc)
+        if not isinstance(peer, transport.Peer):
+            if self.transport is None:
+                return
+            peer = transport.UdpPeer(self.transport, peer)
+        peer.send(message.to_bytes())
+
+    def register_peer(self, peer):
+        self._peers.add(peer)
+
+    def unregister_peer(self, peer):
+        self._peers.discard(peer)
+        for user, known in list(self.peer_by_user.items()):
+            if known is peer:
+                self.peer_by_user.pop(user, None)
+
+    def bind_user_peer(self, user, peer, expires=0):
+        """Remember the connection a registered user came in on.
+
+        With SIP/TCP we can call that user back over the very same socket,
+        which is what makes one-to-many operation behind frp work.
+        """
+        if user and peer is not None:
+            self.peer_by_user[user] = peer
+            if expires > 0:
+                self.loop.call_later(expires, self._expire_peer, user, peer)
+
+    def _expire_peer(self, user, peer):
+        if self.peer_by_user.get(user) is peer and peer.closed:
+            self.peer_by_user.pop(user, None)
+
+    async def outbound_peer(self, user, host, port):
+        """Reuse the user's live TCP connection, else dial a fresh one."""
+        known = self.peer_by_user.get(user)
+        if known is not None and not known.closed and known.kind == "tcp":
+            return known
+        return await transport.open_tcp_connection(host, port, self)
 
     # --------------------------------------------------------------- receive
     def on_datagram(self, data, addr):
@@ -637,20 +742,31 @@ class SipServer:
             message = sipmsg.SipMessage.parse(data)
         except ValueError:
             return
+        peer = transport.UdpPeer(self.transport, addr)
         try:
-            if message.is_request:
-                self._handle_request(message, addr)
-            else:
-                self._handle_response(message, addr)
+            self._dispatch(message, peer)
         except Exception:  # pragma: no cover - never kill the listener
             LOG.exception("failed handling %s", data[:80])
 
-    def _handle_request(self, message, addr):
+    def on_message(self, message, peer):
+        """Unified entry point used by the TCP listener."""
+        try:
+            self._dispatch(message, peer)
+        except Exception:  # pragma: no cover
+            LOG.exception("failed handling %s from %s", message.method, peer)
+
+    def _dispatch(self, message, peer):
+        if message.is_request:
+            self._handle_request(message, peer)
+        else:
+            self._handle_response(message, peer)
+
+    def _handle_request(self, message, peer):
         method = message.method
         if method == "REGISTER":
-            self.registrar.handle(message, addr)
+            self.registrar.handle(message, peer)
         elif method == "INVITE":
-            self.calls.on_invite(message, addr)
+            self.calls.on_invite(message, peer)
         elif method == "ACK":
             leg = self.legs.get(message.call_id)
             if leg:
@@ -666,7 +782,7 @@ class SipServer:
                     leg.on_bye_uac(message)
                 self.legs.pop(message.call_id, None)
             else:
-                self.send_message(sipmsg.build_response(message, 481, "Call/Transaction Does Not Exist"), addr)
+                self.send_message(sipmsg.build_response(message, 481, "Call/Transaction Does Not Exist"), peer)
         elif method == "CANCEL":
             leg = self.legs.get(message.call_id)
             if leg:
@@ -674,45 +790,45 @@ class SipServer:
                     leg.on_cancel(message)
                 else:
                     leg.cancel()
-                    self.send_message(sipmsg.build_response(message, 200, "OK"), addr)
+                    self.send_message(sipmsg.build_response(message, 200, "OK"), peer)
             else:
-                self.send_message(sipmsg.build_response(message, 481, "Call/Transaction Does Not Exist"), addr)
+                self.send_message(sipmsg.build_response(message, 481, "Call/Transaction Does Not Exist"), peer)
         elif method == "OPTIONS":
             self.send_message(sipmsg.build_response(message, 200, "OK", headers=[
-                ("Allow", ALLOW), ("Accept", "application/sdp, text/plain")]), addr)
+                ("Allow", ALLOW), ("Accept", "application/sdp, text/plain")]), peer)
         elif method == "MESSAGE":
-            self._handle_message(message, addr)
+            self._handle_message(message, peer)
         elif method == "INFO":
-            self._handle_info(message, addr)
+            self._handle_info(message, peer)
         else:
-            self.send_message(sipmsg.build_response(message, 501, "Not Implemented"), addr)
+            self.send_message(sipmsg.build_response(message, 501, "Not Implemented"), peer)
 
-    def _handle_response(self, message, addr):
+    def _handle_response(self, message, peer):
         leg = self.legs.get(message.call_id)
         if leg:
             leg.on_response(message)
 
-    def _handle_message(self, message, addr):
+    def _handle_message(self, message, peer):
         target = sipmsg.parse_uri(message.uri)[0] or sipmsg.parse_uri(message.get("To"))[0]
         text = message.body.decode("utf-8", "replace")
         if not self.modem or not self.modem.present:
-            self.send_message(sipmsg.build_response(message, 503, "Service Unavailable"), addr)
+            self.send_message(sipmsg.build_response(message, 503, "Service Unavailable"), peer)
             return
         number = norm_number(target)
         if not number:
-            self.send_message(sipmsg.build_response(message, 400, "Bad Request"), addr)
+            self.send_message(sipmsg.build_response(message, 400, "Bad Request"), peer)
             return
 
         async def _send():
             try:
                 await self.modem.send_sms(number, text)
-                self.send_message(sipmsg.build_response(message, 202, "Accepted"), addr)
+                self.send_message(sipmsg.build_response(message, 202, "Accepted"), peer)
             except Exception as exc:
                 LOG.warning("SIP MESSAGE -> SMS failed: %s", exc)
-                self.send_message(sipmsg.build_response(message, 500, "Server Internal Error"), addr)
+                self.send_message(sipmsg.build_response(message, 500, "Server Internal Error"), peer)
         self.loop.create_task(_send())
 
-    def _handle_info(self, message, addr):
+    def _handle_info(self, message, peer):
         leg = self.legs.get(message.call_id)
         body = message.body.decode("latin-1", "replace")
         match = re.search(r"Signal=(\d+)", body) or re.search(r"([0-9*#])", body)
@@ -723,7 +839,7 @@ class SipServer:
                 leg.call.on_dtmf(leg, digit)
             except Exception:
                 LOG.exception("dtmf relay failed")
-        self.send_message(sipmsg.build_response(message, 200, "OK"), addr)
+        self.send_message(sipmsg.build_response(message, 200, "OK"), peer)
 
     # ---------------------------------------------------------------- status
     def status(self):

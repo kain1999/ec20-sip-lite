@@ -51,6 +51,8 @@ async def main():
     parser.add_argument("--user", required=True)
     parser.add_argument("--password", required=True)
     parser.add_argument("--invite", default="")
+    parser.add_argument("--hold", type=float, default=0.0,
+                        help="after answering, wait N seconds for a BYE from the server")
     parser.add_argument("--local-ip", default="")
     args = parser.parse_args()
 
@@ -121,17 +123,20 @@ async def main():
     invite_call_id = "%s@probe" % secrets.token_hex(4)
     rtp_probe = 40000 + (client.port % 500)
     body = sdp.build_sdp(local_ip, rtp_probe)
-    invite = sipmsg.build_request("INVITE", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
+    invite_headers = [
         ("Via", "SIP/2.0/UDP %s:%d;branch=%s;rport" % (local_ip, client.port, branch())),
         ("Max-Forwards", "70"),
         ("From", "<sip:%s@%s>;tag=%s" % (args.user, host, secrets.token_hex(3))),
         ("To", "<sip:%s@%s>" % (args.invite, host)),
         ("Call-ID", invite_call_id), ("CSeq", "1 INVITE"),
         ("Contact", contact), ("Content-Type", "application/sdp"),
-    ], body=body)
+    ]
+    invite = sipmsg.build_request("INVITE", "sip:%s@%s:%d" % (args.invite, host, port),
+                                  headers=invite_headers, body=body)
     client.send(invite, server)
     print("INVITE ->", args.invite)
-    for _ in range(6):
+    final = None
+    for _ in range(8):
         try:
             message = await client.recv(timeout=6.0)
         except asyncio.TimeoutError:
@@ -142,7 +147,40 @@ async def main():
             continue
         print("  <-", message.status, message.reason)
         if message.status >= 200:
+            final = message
             break
+
+    if final is not None and final.status < 300:
+        client.send(sipmsg.build_request("ACK", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
+            ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (local_ip, client.port, branch())),
+            ("Max-Forwards", "70"),
+            ("From", invite_headers[2][1]),
+            ("To", final.get("To")),
+            ("Call-ID", invite_call_id), ("CSeq", "1 ACK"),
+            ("Content-Length", "0"),
+        ]), server)
+
+        if args.hold > 0:
+            print("holding %.0fs, waiting for the server to hang up..." % args.hold)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + args.hold
+            got_bye = False
+            while loop.time() < deadline:
+                try:
+                    message = await client.recv(timeout=deadline - loop.time())
+                except asyncio.TimeoutError:
+                    break
+                if message.is_request and message.method == "BYE":
+                    client.send(sipmsg.build_response(message, 200, "OK"), server)
+                    print("  <- BYE after %.1fs  [OK: server hung up]"
+                          % (args.hold - (deadline - loop.time())))
+                    got_bye = True
+                    break
+            if not got_bye:
+                print("  no BYE received  [BUG: the other side was not told]")
+            transport.close()
+            return 0 if got_bye else 1
+
     client.send(sipmsg.build_request("BYE", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
         ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (local_ip, client.port, branch())),
         ("From", "<sip:%s@%s>;tag=probe" % (args.user, host)),
