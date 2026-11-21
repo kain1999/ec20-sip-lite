@@ -59,14 +59,22 @@ class Notifier:
     async def forward(self, sms):
         """Apply enabled rules to an inbound SMS. Returns list of (channel, status)."""
         results = []
-        rules = [r for r in self.db.list_rules() if r.get("enabled")]
+        try:
+            rules = [r for r in self.db.list_rules() if r.get("enabled")]
+        except Exception as exc:  # pragma: no cover
+            LOG.warning("cannot load forwarding rules: %s", exc)
+            return results
         for rule in rules:
             if not _matches(rule, sms):
                 continue
             channels = [c.strip() for c in (rule.get("channels") or "").split(",") if c.strip()]
             body = render(rule.get("template"), sms)
             for channel in channels:
-                status, detail = await self._dispatch(channel, body, sms)
+                try:
+                    status, detail = await self._dispatch(channel, body, sms)
+                except Exception as exc:  # never lose one channel's failure
+                    LOG.warning("forward via %s failed: %s", channel, exc)
+                    status, detail = "error", str(exc)[:300]
                 self.db.log_forward(sms.get("id", 0), channel, status, detail)
                 results.append((channel, status))
         if results and all(status == "sent" for _, status in results):

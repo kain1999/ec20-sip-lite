@@ -154,6 +154,13 @@ class SipCall:
         self.ring_legs = []
 
     # ------------------------------------------------------------------ info
+    def set_target(self, number):
+        self.to_user = number
+        try:
+            self.manager.server.db.execute("UPDATE cdr SET to_num=? WHERE id=?", (number, self.cdr_id))
+        except Exception:  # pragma: no cover - CDR is best effort
+            LOG.debug("cannot update CDR target", exc_info=True)
+
     def to_dict(self):
         seconds = int(time.time() - (self.answered_at or self.started))
         label = "通话中" if self.answered_at else ("来电振铃" if self.direction == "in" else "拨号中")
@@ -342,7 +349,7 @@ class CallManager:
         host, port = contact
         leg_b = SipLeg(self.server, call, "uac", user=target)
         call.leg_b = leg_b
-        call.to_user = target
+        call.set_target(target)
         ok = await leg_b.invite(target, host, port, from_user=call.from_user,
                                 display=call.from_user)
         # register only after invite(): invite() assigns the Call-ID
@@ -359,7 +366,7 @@ class CallManager:
             call.leg_a.reject(503, "Modem Unavailable")
             call.end("modem unavailable")
             return
-        call.to_user = number
+        call.set_target(number)
         call.modem_id = "pending"
         call.leg_a.ringing()
         try:
@@ -374,16 +381,22 @@ class CallManager:
     def on_modem_call(self, event, modem_call):
         if event == "incoming":
             self.server.loop.create_task(self._ring_extensions(modem_call))
-        elif event == "active":
-            for call in self.calls.values():
-                if call.modem_id in (None, "pending", modem_call.id) and not call.ended:
-                    if call.direction == "out" and call.modem_id == modem_call.id:
-                        if call.leg_a and call.leg_a.state in ("invited", "ringing"):
-                            call.leg_a.answer()
-                        call.answered_at = call.answered_at or time.time()
-                        self.server.loop.create_task(self._attach_audio(call))
-                        return
-        elif event == "ended":
+            return
+        if event == "active":
+            # the modem call we started for a SIP caller just got answered
+            for call in list(self.calls.values()):
+                if call.ended or not call.leg_a:
+                    continue
+                if call.modem_id not in (modem_call.id, "pending"):
+                    continue
+                call.modem_id = modem_call.id
+                call.answered_at = call.answered_at or time.time()
+                if call.leg_a.state in ("invited", "ringing"):
+                    call.leg_a.answer()
+                self.server.loop.create_task(self._attach_audio(call))
+                return
+            return
+        if event == "ended":
             for call in list(self.calls.values()):
                 if call.modem_id == modem_call.id:
                     if call.leg_a and call.leg_a.state in ("invited", "ringing", "answered", "answered-acked"):

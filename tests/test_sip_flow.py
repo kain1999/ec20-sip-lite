@@ -1,4 +1,4 @@
-﻿"""Integration test: registrar, OPTIONS, SIP MESSAGE and a full extension-to-extension call."""
+"""Integration test: registrar, OPTIONS, SIP MESSAGE and a full extension-to-extension call."""
 import asyncio
 import os
 import secrets
@@ -172,6 +172,33 @@ class SipFlowTest(unittest.IsolatedAsyncioTestCase):
         rows, total = self.db.list_sms()
         self.assertGreaterEqual(total, 1)
         self.assertEqual(rows[0]["peer"], "13800138000")
+
+    async def test_dial_out_through_modem(self):
+        """INVITE to 9<number> must be answered once the modem call becomes active."""
+        await self.register(self.c1, "1001", "pass1")
+        call_id = "modem-%s" % secrets.token_hex(4)
+        invite = self.build("INVITE", "1001", call_id, 1, to_user="913800138000",
+                            body=sdp.build_sdp(IP, 41000),
+                            extra=[("Content-Type", "application/sdp")])
+        self.c1.send(invite)
+        first = await self.c1.recv()
+        self.assertEqual(first.status, 100)
+
+        final = None
+        for _ in range(8):
+            message = await self.c1.recv(timeout=8.0)
+            if message.status == 200:
+                final = message
+                break
+        self.assertIsNotNone(final, "modem call was never answered towards the caller")
+        self.assertIsNotNone(sdp.parse_sdp(final.body))
+
+        row = self.db.list_cdr(1)[0]
+        self.assertEqual(row["to_num"], "13800138000")
+
+        self.c1.send(self.build("BYE", "1001", call_id, 2, to_user="913800138000"))
+        bye = await self.c1.recv()
+        self.assertEqual(bye.status, 200)
 
     async def test_extension_to_extension_call(self):
         await self.register(self.c1, "1001", "pass1")

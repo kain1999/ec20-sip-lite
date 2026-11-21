@@ -71,7 +71,8 @@ async def run(args):
     def on_sms(record):
         if not (db.get_setting("sms", {}) or {}).get("forward_enabled", True):
             return
-        loop.create_task(notifier.forward(record))
+        # may be called from the modem reader thread or the HTTP thread
+        loop.call_soon_threadsafe(loop.create_task, notifier.forward(record))
 
     modem.on_sms = on_sms
     modem.on_call = sip.calls.on_modem_call

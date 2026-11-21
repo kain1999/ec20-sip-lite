@@ -115,6 +115,7 @@ class AppContext:
             "calls": self.sip.calls.status() if self.sip else [],
             "sip": sip_status,
             "sms": self.db.sms_stats(),
+            "sim": self.sim,
             "forward": {"enabled": bool(settings.get("sms", {}).get("forward_enabled", True)),
                         "channels": channels},
         }
@@ -564,6 +565,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/modem/init" and method == "POST":
             ctx.spawn(ctx.modem.init_modem())
             self._json({"ok": True})
+            return
+
+        # ---------------------------------------------------- simulator only
+        if path == "/api/sim/incoming" and method == "POST":
+            if not ctx.sim:
+                self._error("模拟模式才可用", 400)
+                return
+            payload = self._body()
+            number = norm_number(payload.get("number", "13800138000")) or "13800138000"
+            call_id = ctx.modem.simulate_incoming(number)
+            self._json({"ok": True, "call_id": call_id})
+            return
+
+        if path == "/api/sim/sms" and method == "POST":
+            if not ctx.sim:
+                self._error("模拟模式才可用", 400)
+                return
+            payload = self._body()
+            peer = str(payload.get("peer", "13800138000"))
+            text = str(payload.get("text", "模拟短信：验证码 123456"))
+            record = ctx.modem.simulate_sms(peer, text)
+            self._json({"ok": True, "sms": record})
             return
 
         if path == "/api/modem/reset" and method == "POST":
