@@ -1,0 +1,53 @@
+{
+  "sip": {
+    "bind": "0.0.0.0",
+    "port": 5060,
+    "realm": "ec20sip.local",
+    "external_ip": "",
+    "register_expiry": 3600,
+    "max_extensions": 64
+  },
+  "ec20": {
+    "at_port": "/dev/ec20-at",
+    "fallback_at_ports": ["/dev/ttyUSB2", "/dev/ttyUSB3"],
+    "baud": 115200,
+    "audio_device": "",
+    "audio_card_match": "EC20",
+    "audio_rate": 8000,
+    "audio_channels": 1,
+    "audio_sample": "S16_LE",
+    "qaumod": 3,
+    "voice_prefix": "9",
+    "ring_seconds": 30,
+    "auto_answer": false,
+    "poll_interval": 20,
+    "init_commands": [
+      "ATE0",
+      "AT+CMEE=2",
+      "AT+CMGF=0",
+      "AT+CSCS=\"UCS2\"",
+      "AT+CPMS=\"SM\",\"SM\",\"SM\"",
+      "AT+CNMI=2,1,0,0,0"
+    ],
+    "optional_commands": [
+      "AT+QAUDMOD={qaumod}",
+      "AT+QPCMV=0",
+      "AT+QCFG=\"ims\",1"
+    ]
+  },
+  "web": {
+    "bind": "0.0.0.0",
+    "port": 8080,
+    "session_ttl": 86400
+  },
+  "sms": {
+    "forward_enabled": true,
+    "max_store": 2000
+  },
+  "paths": {
+    "data_dir": "/var/lib/ec20-sip",
+    "log_file": "/var/log/ec20-sip.log",
+    "run_dir": "/run/ec20-sip"
+  },
+  "debug": false
+}

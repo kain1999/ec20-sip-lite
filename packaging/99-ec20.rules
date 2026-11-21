@@ -1,0 +1,20 @@
+# Quectel EC20/EC25 on hisi vendor kernels (no option.ko, usbserial_generic only)
+#
+# The vendor kernel ships usbserial/usbserial_generic built in but has no table
+# entry for the EC20-CE-HCLG composition, so no /dev/ttyUSB* is created until the
+# VID/PID is written to generic/new_id. That is what ec20-bind.sh does.
+#
+# Stable names use ENV{} keys computed by the udev builtin for USB devices;
+# ATTRS{idVendor} lookups are unreliable on this kernel.
+
+# 1) bind the generic driver as soon as the module is (re-)enumerated
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2c7c", ATTR{idProduct}=="0125", RUN+="/usr/local/sbin/ec20-bind.sh --quiet"
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="2c7c", ATTR{idProduct}=="0126", RUN+="/usr/local/sbin/ec20-bind.sh --quiet"
+
+# 2) stable device names (interface 2 = AT, interface 3 = modem/PPP)
+SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="2c7c", ENV{ID_USB_INTERFACE_NUM}=="02", SYMLINK+="ec20-at", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="2c7c", ENV{ID_USB_INTERFACE_NUM}=="03", SYMLINK+="ec20-data", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="tty", ENV{ID_VENDOR_ID}=="2c7c", ENV{ID_USB_INTERFACE_NUM}=="00", SYMLINK+="ec20-diag", MODE="0660", GROUP="dialout"
+
+# 3) the module's USB audio class (after AT+QCFG="usbcfg",...,uac=1)
+SUBSYSTEM=="sound", ENV{ID_VENDOR_ID}=="2c7c", SYMLINK+="ec20-snd"

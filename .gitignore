@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+.DS_Store
+_*.py
+*.tar.gz

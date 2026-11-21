@@ -1,0 +1,636 @@
+"""SIP signalling: UDP transport, registrar, and the B2BUA that bridges calls."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import secrets
+import socket
+import time
+
+from .. import media
+from ..sip import digest, message as sipmsg, sdp
+from ..sip.leg import SipLeg
+from ..util import norm_number, ts_str
+
+LOG = logging.getLogger("sip")
+
+ALLOW = "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE, INFO"
+
+CONTACT_RE = re.compile(r"<sip:([^@>]*)@([^>:;]+)(?::(\d+))?")
+
+
+def local_ip():
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.settimeout(0.3)
+        probe.connect(("192.0.2.1", 9))
+        ip = probe.getsockname()[0]
+        probe.close()
+        return ip
+    except OSError:
+        return "127.0.0.1"
+
+
+class UdpProtocol(asyncio.DatagramProtocol):
+    def __init__(self, server):
+        self.server = server
+
+    def connection_made(self, transport):
+        self.server.transport = transport
+
+    def datagram_received(self, data, addr):
+        self.server.on_datagram(data, addr)
+
+    def error_received(self, exc):  # pragma: no cover
+        LOG.debug("sip socket error: %s", exc)
+
+
+class Registrar:
+    def __init__(self, server):
+        self.server = server
+        self.db = server.db
+
+    def contact(self, number):
+        row = self.db.get_registration(number)
+        if not row:
+            return None
+        expires = int(row.get("expires") or 0)
+        updated = row.get("updated_at") or ""
+        try:
+            stamp = time.mktime(time.strptime(updated, "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            stamp = 0
+        if expires and stamp and time.time() > stamp + expires:
+            self.db.remove_registration(number)
+            return None
+        return row
+
+    def registered(self):
+        out = {}
+        for row in self.db.registrations():
+            number = row["number"]
+            if self.contact(number):
+                out[number] = self.contact(number)
+        return out
+
+    def handle(self, message, addr):
+        server = self.server
+        to_user = sipmsg.parse_uri(message.get("To") or "")[0]
+        from_user = sipmsg.parse_uri(message.get("From") or "")[0]
+        number = to_user or from_user
+        if not number:
+            server.send_message(sipmsg.build_response(message, 400, "Bad Request"), addr)
+            return
+        extension = self.db.get_extension(number)
+        if not extension or not int(extension.get("enabled", 1)):
+            server.send_message(sipmsg.build_response(message, 403, "Forbidden"), addr)
+            return
+        if not message.get("Authorization"):
+            server.send_message(sipmsg.build_response(message, 401, "Unauthorized", headers=[
+                ("WWW-Authenticate", server.auth.challenge())]), addr)
+            return
+        ok, reason = server.auth.verify(message, extension["password"])
+        if not ok:
+            LOG.info("REGISTER auth failed for %s: %s", number, reason)
+            server.send_message(sipmsg.build_response(message, 401, "Unauthorized", headers=[
+                ("WWW-Authenticate", server.auth.challenge(stale=(reason == "stale nonce")))]), addr)
+            return
+
+        contact_header = message.get("Contact") or ""
+        expires_header = message.get("Expires")
+        expires = server.config.get("sip.register_expiry", 3600)
+        if expires_header and expires_header.strip().isdigit():
+            expires = int(expires_header.strip())
+        match = re.search(r"expires=(\d+)", contact_header)
+        if match:
+            expires = int(match.group(1))
+        if expires <= 0:
+            self.db.remove_registration(number)
+            LOG.info("unregistered %s", number)
+            server.send_message(sipmsg.build_response(message, 200, "OK", headers=[
+                ("Contact", contact_header or "<sip:%s@%s>" % (number, server.media_ip)),
+                ("Expires", "0")]), addr)
+            return
+        default_port = server.config.get("sip.port", 5060)
+        contact_match = CONTACT_RE.search(contact_header)
+        host, port = "", default_port
+        if contact_match:
+            host = contact_match.group(2)
+            port = int(contact_match.group(3) or default_port)
+        if not host or host in ("0.0.0.0", "::"):
+            host, port = addr[0], addr[1] or default_port
+        contact_uri = "<sip:%s@%s:%d;transport=udp>" % (number, host, port)
+        self.db.upsert_registration(number, contact_uri, expires,
+                                    user_agent=message.get("User-Agent", ""),
+                                    transport="udp", call_id=message.call_id, source_ip=addr[0])
+        LOG.info("registered %s at %s:%s (expires %ss)", number, host, port, expires)
+        server.send_message(sipmsg.build_response(message, 200, "OK", headers=[
+            ("Contact", contact_uri),
+            ("Expires", str(expires)),
+            ("Allow", ALLOW)]), addr)
+
+
+class SipCall:
+    """A bridged call: leg_a (SIP phone) and leg_b (phone or modem)."""
+
+    def __init__(self, manager, direction, from_user, to_user):
+        self.manager = manager
+        self.id = "c" + secrets.token_hex(4)
+        self.direction = direction
+        self.from_user = from_user
+        self.to_user = to_user
+        self.started = time.time()
+        self.answered_at = None
+        self.ended = False
+        self.leg_a = None
+        self.leg_b = None
+        self.modem_id = None
+        self.modem_port = None
+        self.bridge = None
+        self.audio = None
+        self.cdr_id = manager.server.db.add_cdr(ts_str(), from_user, to_user, direction)
+        self._answered = asyncio.Event()
+        self.ring_legs = []
+
+    # ------------------------------------------------------------------ info
+    def to_dict(self):
+        seconds = int(time.time() - (self.answered_at or self.started))
+        label = "通话中" if self.answered_at else ("来电振铃" if self.direction == "in" else "拨号中")
+        if self.ended:
+            label = "已结束"
+        return {"id": self.id, "dir": self.direction, "from": self.from_user, "to": self.to_user,
+                "state": label, "duration": seconds, "answered": bool(self.answered_at)}
+
+    # --------------------------------------------------------------- events
+    def on_leg_ringing(self, leg):
+        if leg is self.leg_b and self.leg_a:
+            self.leg_a.ringing()
+        if leg in self.ring_legs:
+            for other in self.ring_legs:
+                if other is not leg and other.state == "inviting":
+                    other.cancel()
+
+    def on_leg_answered(self, leg):
+        if self.ended:
+            leg.send_bye()
+            return
+        if leg in self.ring_legs and self.leg_a is not leg:
+            # an extension picked up a modem call
+            self.leg_a = leg
+            self.answered_at = time.time()
+            for other in self.ring_legs:
+                if other is not leg:
+                    other.cancel()
+            self._answered.set()
+            self.manager.server.loop.create_task(self._connect_modem())
+            return
+        if leg is self.leg_b and self.leg_a:
+            if self.leg_a.answer():
+                self.answered_at = time.time()
+                self._start_bridge()
+            else:
+                self.end("channel unavailable")
+
+    def on_leg_failed(self, leg, status, reason):
+        LOG.info("leg failed %s: %s %s", leg.display, status, reason)
+        if leg is self.leg_b and self.leg_a:
+            code = 486 if status in (486, 480) else 503
+            self.leg_a.reject(code, "Destination Unavailable")
+            self.end("failed")
+        elif leg in self.ring_legs and self.leg_a is leg:
+            self.end("failed")
+
+    def on_leg_bye(self, leg):
+        if leg is self.leg_a:
+            if self.leg_b:
+                self.leg_b.send_bye()
+            if self.manager.is_modem_call(self):
+                self.manager.server.loop.create_task(self.manager.modem_hangup())
+        else:
+            if self.leg_a and self.leg_a.state in ("answered", "answered-acked"):
+                self.leg_a.send_bye()
+        self.end("bye")
+
+    def on_leg_cancel(self, leg):
+        self.end("cancel")
+
+    def on_dtmf(self, leg, digit):
+        if self.manager.is_modem_call(self):
+            self.manager.server.loop.create_task(self.manager.play_dtmf(digit))
+        elif leg is self.leg_a and self.leg_b:
+            self.leg_b.media.send_dtmf(digit)
+        elif leg is self.leg_b and self.leg_a:
+            self.leg_a.media.send_dtmf(digit)
+
+    # --------------------------------------------------------------- bridge
+    def _start_bridge(self):
+        loop = self.manager.server.loop
+        if self.leg_b is not None:
+            self.bridge = media.Bridge(loop, self.leg_a.media, self.leg_b.media).start()
+        elif self.modem_port is not None:
+            self.bridge = media.Bridge(loop, self.leg_a.media, self.modem_port).start()
+        LOG.info("bridge up for call %s (%s -> %s)", self.id, self.from_user, self.to_user)
+
+    async def _connect_modem(self):
+        self.answered_at = self.answered_at or time.time()
+        if self.manager.server.modem:
+            try:
+                await self.manager.server.modem.answer()
+            except Exception as exc:
+                LOG.warning("modem answer failed: %s", exc)
+                self.end("modem answer failed")
+                return
+        await self.manager.start_modem_audio(self)
+        self._start_bridge()
+
+    def end(self, reason=""):
+        if self.ended:
+            return
+        self.ended = True
+        loop = self.manager.server.loop
+        if self.bridge:
+            loop.create_task(self.bridge.stop())
+            self.bridge = None
+        if self.modem_port:
+            loop.create_task(self.modem_port.stop())
+            self.modem_port = None
+        for leg in (self.leg_a, self.leg_b):
+            if leg:
+                if leg.state in ("answered", "answered-acked"):
+                    leg.send_bye()
+                leg.close()
+        duration = int(time.time() - (self.answered_at or self.started))
+        self.manager.server.db.finish_cdr(self.cdr_id, "answered" if self.answered_at else reason or "missed",
+                                          duration)
+        self.manager.calls.pop(self.id, None)
+        LOG.info("call %s ended (%s, %ds)", self.id, reason, duration)
+
+
+class CallManager:
+    def __init__(self, server):
+        self.server = server
+        self.calls = {}
+
+    # -------------------------------------------------------------- helpers
+    def _registered_contact(self, number):
+        contact = self.server.registrar.contact(number)
+        if not contact:
+            return None
+        match = CONTACT_RE.search(contact.get("contact", ""))
+        if match:
+            return match.group(2), int(match.group(3) or self.server.config.get("sip.port", 5060))
+        return None
+
+    def is_modem_call(self, call):
+        return call.modem_id is not None or self.server.modem is not None and call.direction == "in"
+
+    async def modem_hangup(self):
+        if self.server.modem:
+            await self.server.modem.hangup()
+
+    async def play_dtmf(self, digit):
+        if self.server.modem:
+            await self.server.modem.send_dtmf(digit)
+
+    async def start_modem_audio(self, call):
+        loop = self.server.loop
+        audio = self.server.make_audio()
+        call.audio = audio
+        port = media.ModemPort(loop, audio)
+        if not await port.start():
+            LOG.warning("modem audio unavailable: %s", audio.last_error)
+        call.modem_port = port
+
+    # ------------------------------------------------------------- incoming
+    def on_invite(self, message, addr):
+        from_user = sipmsg.parse_uri(message.get("From"))[0]
+        to_user = sipmsg.parse_uri(message.get("To"))[0] or sipmsg.parse_uri(message.uri)[0]
+        extension = self.server.db.get_extension(from_user) if from_user else None
+        if not extension or not int(extension.get("enabled", 1)):
+            self.server.send_message(sipmsg.build_response(message, 403, "Forbidden"), addr)
+            return
+        if not to_user:
+            self.server.send_message(sipmsg.build_response(message, 404, "Not Found"), addr)
+            return
+        call = SipCall(self, "in", from_user, to_user)
+        self.calls[call.id] = call
+        leg = SipLeg(self.server, call, "uas", user=from_user)
+        call.leg_a = leg
+        self.server.loop.create_task(self._setup_invite(call, leg, message, addr, to_user))
+
+    async def _setup_invite(self, call, leg, message, addr, target):
+        await leg.accept(message, addr)
+        self.server.legs[leg.call_id] = leg
+        prefix = str(self.server.config.get("ec20.voice_prefix", "9") or "")
+        extension = self.server.db.get_extension(target)
+        contact = self._registered_contact(target) if extension else None
+        if extension and contact:
+            await self._call_extension(call, target, contact, addr)
+            return
+        number = target
+        if prefix and number.startswith(prefix):
+            number = number[len(prefix):]
+        number = norm_number(number)
+        if not number or len(number) < 3:
+            leg.reject(404, "Not Found")
+            call.end("not found")
+            return
+        await self._call_modem(call, number)
+
+    async def _call_extension(self, call, target, contact, addr):
+        host, port = contact
+        leg_b = SipLeg(self.server, call, "uac", user=target)
+        call.leg_b = leg_b
+        call.to_user = target
+        ok = await leg_b.invite(target, host, port, from_user=call.from_user,
+                                display=call.from_user)
+        # register only after invite(): invite() assigns the Call-ID
+        self.server.legs[leg_b.call_id] = leg_b
+        if not ok:
+            call.leg_a.reject(503, "Service Unavailable")
+            call.end("invite failed")
+            return
+        call.leg_a.ringing()
+
+    async def _call_modem(self, call, number):
+        modem = self.server.modem
+        if not modem or not modem.present:
+            call.leg_a.reject(503, "Modem Unavailable")
+            call.end("modem unavailable")
+            return
+        call.to_user = number
+        call.modem_id = "pending"
+        call.leg_a.ringing()
+        try:
+            call.modem_id = await modem.dial(number)
+        except Exception as exc:
+            LOG.warning("modem dial %s failed: %s", number, exc)
+            call.leg_a.reject(503, "Modem Dial Failed")
+            call.end("dial failed")
+            return
+
+    # -------------------------------------------------- modem-driven events
+    def on_modem_call(self, event, modem_call):
+        if event == "incoming":
+            self.server.loop.create_task(self._ring_extensions(modem_call))
+        elif event == "active":
+            for call in self.calls.values():
+                if call.modem_id in (None, "pending", modem_call.id) and not call.ended:
+                    if call.direction == "out" and call.modem_id == modem_call.id:
+                        if call.leg_a and call.leg_a.state in ("invited", "ringing"):
+                            call.leg_a.answer()
+                        call.answered_at = call.answered_at or time.time()
+                        self.server.loop.create_task(self._attach_audio(call))
+                        return
+        elif event == "ended":
+            for call in list(self.calls.values()):
+                if call.modem_id == modem_call.id:
+                    if call.leg_a and call.leg_a.state in ("invited", "ringing", "answered", "answered-acked"):
+                        call.leg_a.send_bye()
+                    call.end("modem ended")
+
+    async def _attach_audio(self, call):
+        await self.start_modem_audio(call)
+        if not call.bridge and call.answered_at:
+            call._start_bridge()
+
+    async def _ring_extensions(self, modem_call):
+        ring_seconds = int(self.server.config.get("ec20.ring_seconds", 30))
+        call = SipCall(self, "in", "modem", modem_call.number)
+        call.modem_id = modem_call.id
+        call.to_user = modem_call.number
+        self.calls[call.id] = call
+        dial = self.server.db.get_setting("dial", {}) or {}
+        target = (dial.get("forward_all_to") or "").strip()
+        numbers = [target] if target else list(self.server.registrar.registered().keys())
+        if not numbers:
+            LOG.info("incoming call with no registered extension, rejecting")
+            await self.server.modem.hangup()
+            call.end("no extension")
+            return
+        legs = []
+        for number in numbers:
+            contact = self._registered_contact(number)
+            if not contact:
+                continue
+            host, port = contact
+            leg = SipLeg(self.server, call, "uac", user=number)
+            await leg.invite(number, host, port, from_user="modem", display="EC20 来电")
+            self.server.legs[leg.call_id] = leg
+            call.ring_legs.append(leg)
+            legs.append(leg)
+        if not legs:
+            await self.server.modem.hangup()
+            call.end("no contact")
+            return
+        try:
+            await asyncio.wait_for(call._answered.wait(), ring_seconds)
+        except asyncio.TimeoutError:
+            LOG.info("incoming call not answered in %ss", ring_seconds)
+            for leg in legs:
+                leg.cancel()
+            await self.server.modem.hangup()
+            call.end("no answer")
+
+    # ------------------------------------------------------------------ api
+    def dial(self, number):
+        modem = self.server.modem
+        if not modem or not modem.present:
+            raise RuntimeError("模块未就绪")
+        number = norm_number(number)
+        call = SipCall(self, "out", "panel", number)
+        call.modem_id = "pending"
+        self.calls[call.id] = call
+
+        async def _run():
+            try:
+                call.modem_id = await modem.dial(number)
+            except Exception as exc:
+                LOG.warning("panel dial failed: %s", exc)
+                call.end("dial failed")
+        self.server.loop.create_task(_run())
+        return call.id
+
+    def hangup(self, call_id):
+        call = self.calls.get(call_id)
+        if not call:
+            return False
+        if call.modem_id and call.modem_id != "pending":
+            self.server.loop.create_task(self.modem_hangup())
+        call.end("panel hangup")
+        return True
+
+    def answer(self, call_id):
+        call = self.calls.get(call_id)
+        if not call:
+            return False
+        self.server.loop.create_task(call._connect_modem())
+        return True
+
+    def status(self):
+        return [call.to_dict() for call in self.calls.values()]
+
+
+class SipServer:
+    def __init__(self, loop, config, db, modem=None):
+        self.loop = loop
+        self.config = config
+        self.db = db
+        self.modem = modem
+        self.transport = None
+        self.media_ip = config.get("sip.external_ip") or local_ip()
+        self.bind = config.get("sip.bind", "0.0.0.0")
+        self.port = int(config.get("sip.port", 5060))
+        self.auth = digest.DigestAuth(config.get("sip.realm", "ec20sip.local"))
+        self.registrar = Registrar(self)
+        self.calls = CallManager(self)
+        self.legs = {}
+        self.dialogs = {}
+        self.started = time.time()
+        self.sim_audio = False
+
+    # ------------------------------------------------------------------ life
+    async def start(self):
+        await self.loop.create_datagram_endpoint(lambda: UdpProtocol(self),
+                                                 local_addr=(self.bind, self.port))
+        sockname = self.transport.get_extra_info("sockname")
+        LOG.info("SIP listening on %s:%s (advertising %s)", sockname[0], sockname[1], self.media_ip)
+        return True
+
+    async def stop(self):
+        for call in list(self.calls.calls.values()):
+            call.end("shutdown")
+        for leg in list(self.legs.values()):
+            leg.close()
+        self.legs.clear()
+        if self.transport:
+            self.transport.close()
+            self.transport = None
+
+    def make_audio(self):
+        from ..ec20.audio import AlsaAudio, ToneAudio, detect_device
+        if self.sim_audio:
+            return ToneAudio(self.loop)
+        device = self.config.get("ec20.audio_device") or detect_device(
+            self.config.get("ec20.audio_card_match", "EC20"))
+        audio = AlsaAudio(self.loop, device, rate=int(self.config.get("ec20.audio_rate", 8000)),
+                          channels=int(self.config.get("ec20.audio_channels", 1)),
+                          sample=self.config.get("ec20.audio_sample", "S16_LE"))
+        if not device:
+            LOG.warning("no EC20 sound card, falling back to tone audio")
+            return ToneAudio(self.loop)
+        return audio
+
+    # ------------------------------------------------------------------ send
+    def send_message(self, message, addr):
+        if not self.transport or not addr:
+            return
+        try:
+            self.transport.sendto(message.to_bytes(), addr)
+        except OSError as exc:  # pragma: no cover
+            LOG.debug("send to %s failed: %s", addr, exc)
+
+    # --------------------------------------------------------------- receive
+    def on_datagram(self, data, addr):
+        try:
+            message = sipmsg.SipMessage.parse(data)
+        except ValueError:
+            return
+        try:
+            if message.is_request:
+                self._handle_request(message, addr)
+            else:
+                self._handle_response(message, addr)
+        except Exception:  # pragma: no cover - never kill the listener
+            LOG.exception("failed handling %s", data[:80])
+
+    def _handle_request(self, message, addr):
+        method = message.method
+        if method == "REGISTER":
+            self.registrar.handle(message, addr)
+        elif method == "INVITE":
+            self.calls.on_invite(message, addr)
+        elif method == "ACK":
+            leg = self.legs.get(message.call_id)
+            if leg:
+                leg.on_ack(message)
+            else:
+                self.dialogs.pop(message.call_id, None)
+        elif method == "BYE":
+            leg = self.legs.get(message.call_id)
+            if leg:
+                if leg.role == "uas":
+                    leg.on_bye(message)
+                else:
+                    leg.on_bye_uac(message)
+                self.legs.pop(message.call_id, None)
+            else:
+                self.send_message(sipmsg.build_response(message, 481, "Call/Transaction Does Not Exist"), addr)
+        elif method == "CANCEL":
+            leg = self.legs.get(message.call_id)
+            if leg:
+                if leg.role == "uas":
+                    leg.on_cancel(message)
+                else:
+                    leg.cancel()
+                    self.send_message(sipmsg.build_response(message, 200, "OK"), addr)
+            else:
+                self.send_message(sipmsg.build_response(message, 481, "Call/Transaction Does Not Exist"), addr)
+        elif method == "OPTIONS":
+            self.send_message(sipmsg.build_response(message, 200, "OK", headers=[
+                ("Allow", ALLOW), ("Accept", "application/sdp, text/plain")]), addr)
+        elif method == "MESSAGE":
+            self._handle_message(message, addr)
+        elif method == "INFO":
+            self._handle_info(message, addr)
+        else:
+            self.send_message(sipmsg.build_response(message, 501, "Not Implemented"), addr)
+
+    def _handle_response(self, message, addr):
+        leg = self.legs.get(message.call_id)
+        if leg:
+            leg.on_response(message)
+
+    def _handle_message(self, message, addr):
+        target = sipmsg.parse_uri(message.uri)[0] or sipmsg.parse_uri(message.get("To"))[0]
+        text = message.body.decode("utf-8", "replace")
+        if not self.modem or not self.modem.present:
+            self.send_message(sipmsg.build_response(message, 503, "Service Unavailable"), addr)
+            return
+        number = norm_number(target)
+        if not number:
+            self.send_message(sipmsg.build_response(message, 400, "Bad Request"), addr)
+            return
+
+        async def _send():
+            try:
+                await self.modem.send_sms(number, text)
+                self.send_message(sipmsg.build_response(message, 202, "Accepted"), addr)
+            except Exception as exc:
+                LOG.warning("SIP MESSAGE -> SMS failed: %s", exc)
+                self.send_message(sipmsg.build_response(message, 500, "Server Internal Error"), addr)
+        self.loop.create_task(_send())
+
+    def _handle_info(self, message, addr):
+        leg = self.legs.get(message.call_id)
+        body = message.body.decode("latin-1", "replace")
+        match = re.search(r"Signal=(\d+)", body) or re.search(r"([0-9*#])", body)
+        if leg and match:
+            digit = {"0": "0", "1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6",
+                     "7": "7", "8": "8", "9": "9", "10": "*", "11": "#"}.get(match.group(1), match.group(1))
+            try:
+                leg.call.on_dtmf(leg, digit)
+            except Exception:
+                LOG.exception("dtmf relay failed")
+        self.send_message(sipmsg.build_response(message, 200, "OK"), addr)
+
+    # ---------------------------------------------------------------- status
+    def status(self):
+        registrations = self.db.registrations()
+        return {
+            "listening": "%s:%d" % (self.media_ip, self.port),
+            "registrations": len([r for r in registrations if self.registrar.contact(r["number"])]),
+            "extensions": len(self.db.list_extensions()),
+            "active_calls": len(self.calls.calls),
+        }

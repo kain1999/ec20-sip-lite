@@ -1,0 +1,25 @@
+[Unit]
+Description=ec20-sip-lite: SIP registrar/B2BUA + EC20 gateway
+Documentation=file:///opt/ec20-sip-lite/README.md
+After=network-online.target sound.target
+Wants=network-online.target
+ConditionPathExists=/opt/ec20-sip-lite/app/main.py
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ec20-sip-lite
+ExecStart=/usr/bin/python3 -m app.main -c /etc/ec20-sip/config.json
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=always
+RestartSec=3
+# Keep the appliance inside its RAM budget; the service is a single Python
+# process (~40 MB resident with two concurrent G.711 calls).
+MemoryHigh=180M
+MemoryMax=260M
+OOMScoreAdjust=-300
+# the modem must not be grabbed by ModemManager/ppp
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
