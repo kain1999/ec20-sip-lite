@@ -16,17 +16,23 @@ JITTER_FRAMES = 6          # 120 ms cap: enough for Wi-Fi jitter, tiny in RAM
 
 
 class RtpPort:
-    def __init__(self, loop, bind_ip="0.0.0.0", on_dtmf=None):
+    def __init__(self, loop, bind_ip="0.0.0.0", on_dtmf=None, allocator=None):
         self.loop = loop
         self.bind_ip = bind_ip
         self.on_dtmf = on_dtmf
+        self.allocator = allocator
         self.codec = "PCMU"
         self.rtp = RtpSession(loop, bind_ip, on_pcm=self._on_pcm,
                               on_dtmf=on_dtmf, codec="PCMU", pt=0)
         self._inbox = collections.deque(maxlen=JITTER_FRAMES)
 
     async def open(self):
-        return await self.rtp.open()
+        port = self.allocator.reserve() if self.allocator else None
+        try:
+            return await self.rtp.open(preferred_port=port)
+        finally:
+            if port is not None and self.port != port:
+                self.allocator.release(port)
 
     @property
     def port(self):
@@ -60,6 +66,41 @@ class RtpPort:
 
     def close(self):
         self.rtp.close()
+        if self.allocator:
+            self.allocator.release(self.rtp.local_port)
+
+
+class PortAllocator:
+    """Hands out a fixed list of RTP ports (needed when running behind frp).
+
+    Without a fixed list every call would pick an ephemeral port that the frp
+    tunnel does not forward, so audio would be one-way.
+    """
+
+    def __init__(self, ports=None):
+        self.all_ports = [int(p) for p in (ports or []) if str(p).strip().isdigit()]
+        self._used = set()
+
+    @property
+    def enabled(self):
+        return bool(self.all_ports)
+
+    def reserve(self):
+        if not self.all_ports:
+            return None
+        for port in self.all_ports:
+            if port not in self._used:
+                self._used.add(port)
+                return port
+        LOG.warning("all configured RTP ports are in use (%s); using ephemeral",
+                    self.all_ports)
+        return None
+
+    def release(self, port):
+        self._used.discard(int(port or 0))
+
+    def status(self):
+        return {"ports": self.all_ports, "in_use": sorted(self._used)}
 
     def stats(self):
         return {"rx": self.rtp.rx_packets, "tx": self.rtp.tx_packets,

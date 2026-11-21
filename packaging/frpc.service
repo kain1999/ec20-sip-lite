@@ -1,0 +1,18 @@
+[Unit]
+Description=frpc client (ec20-sip-lite tunnels)
+Documentation=https://gofrp.org
+After=network-online.target ec20-sip.service
+Wants=network-online.target
+ConditionPathExists=/etc/frp/frpc.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/frpc -c /etc/frp/frpc.toml
+Restart=always
+RestartSec=5
+# frpc is tiny (~10MB) but must never starve the SIP service
+MemoryMax=80M
+OOMScoreAdjust=200
+
+[Install]
+WantedBy=multi-user.target

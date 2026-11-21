@@ -39,7 +39,8 @@ class SipLeg:
         self.state = "init"
         self.invite_msg = None
         self.pending_request = None
-        self.media = media.RtpPort(server.loop, on_dtmf=self._on_dtmf)
+        self.media = media.RtpPort(server.loop, on_dtmf=self._on_dtmf,
+                                   allocator=getattr(server, "rtp_allocator", None))
         self._retransmit_task = None
         self._answered_200 = None
         self.last_error = ""

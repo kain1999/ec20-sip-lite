@@ -58,7 +58,18 @@ class RtpSession:
         self.tx_packets = 0
 
     # ---------------------------------------------------------------- life
-    async def open(self):
+    async def open(self, preferred_port=None):
+        if preferred_port:
+            try:
+                self.transport, self._protocol = await self.loop.create_datagram_endpoint(
+                    lambda: RtpProtocol(self), local_addr=(self.bind_ip, int(preferred_port))
+                )
+                self.local_port = self.transport.get_extra_info("sockname")[1]
+                LOG.debug("rtp bound to configured port %d", self.local_port)
+                return self.local_port
+            except OSError as exc:
+                LOG.warning("rtp port %s unavailable (%s), falling back to ephemeral",
+                            preferred_port, exc)
         self.transport, self._protocol = await self.loop.create_datagram_endpoint(
             lambda: RtpProtocol(self), local_addr=(self.bind_ip, 0)
         )

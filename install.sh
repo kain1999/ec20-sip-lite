@@ -76,6 +76,20 @@ udevadm trigger 2>/dev/null || true
 
 echo "-- systemd units"
 install -m 0644 "$APP_DIR/packaging/ec20-sip.service" /etc/systemd/system/ec20-sip.service
+if [ -f "$APP_DIR/packaging/frpc.toml" ]; then
+    mkdir -p /etc/frp
+    if [ "$UPGRADE" = "0" ] || [ ! -f /etc/frp/frpc.toml ]; then
+        install -m 0644 "$APP_DIR/packaging/frpc.toml" /etc/frp/frpc.toml
+        echo "   installed /etc/frp/frpc.toml (edit serverAddr/ports as needed)"
+    else
+        echo "   /etc/frp/frpc.toml kept"
+    fi
+fi
+if [ -f "$APP_DIR/packaging/frpc.service" ] && command -v frpc >/dev/null 2>&1; then
+    install -m 0644 "$APP_DIR/packaging/frpc.service" /etc/systemd/system/frpc.service
+    systemctl enable frpc.service >/dev/null 2>&1 || true
+    echo "   frpc.service installed (frpc binary found)"
+fi
 cat > /etc/systemd/system/ec20-bind.service <<'UNIT'
 [Unit]
 Description=Bind EC20 USB serial interfaces (usbserial_generic)

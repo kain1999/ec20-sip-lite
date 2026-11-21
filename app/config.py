@@ -21,6 +21,10 @@ DEFAULTS = {
         "port": 5060,
         "realm": "ec20sip.local",
         "external_ip": "",
+        # RTP media ports. Leave empty to use ephemeral ports (LAN only).
+        # Set a list (e.g. [10000,10001,10003,10004]) when the box sits behind
+        # frp/NAT: these must match the udp tunnels on the frp server.
+        "rtp_ports": [],
         "udp_port_min": 40000,
         "udp_port_max": 40099,
         "register_expiry": 3600,

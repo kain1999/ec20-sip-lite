@@ -1,0 +1,78 @@
+# frpc 配置 — ec20-sip-lite
+#
+# 与 ec20-sip-lite 的对应关系（重要）：
+#   SIP 信令  UDP 5060            -> 远程 5060
+#   RTP 媒体  UDP 10000-10004     -> 远程同名端口
+#
+# 因此盒子上的 /etc/ec20-sip/config.json 必须写：
+#   "sip": { "rtp_ports": [10000, 10001, 10003, 10004], "external_ip": "8.137.213.214" }
+# 否则 RTP 会用随机端口，frp 没映射 -> 对方听得见你、你听不见对方（单通）。
+#
+# 启动：  frpc -c /etc/frp/frpc.toml
+# 校验：  frpc verify -c /etc/frp/frpc.toml
+
+serverAddr = "8.137.213.214"
+serverPort = 1210
+user = "flnzAXugWU8u"
+loginFailExit = false
+
+# 被限速时可改成 websocket
+# transport.protocol = "websocket"
+transport.heartbeatInterval = 10
+transport.heartbeatTimeout = 60
+
+# ---------------------------------------------------------------- SIP 信令
+[[proxies]]
+type = "udp"
+name = "zlA7px5GTCm4"
+localIP = "127.0.0.1"
+localPort = 5060
+remotePort = 5060
+transport.useEncryption = true
+transport.useCompression = true
+
+# ------------------------------------------------------------ RTP 媒体端口
+[[proxies]]
+type = "udp"
+name = "GjAnRK4hJQbz"
+localIP = "127.0.0.1"
+localPort = 10000
+remotePort = 10000
+transport.useEncryption = true
+transport.useCompression = true
+
+[[proxies]]
+type = "udp"
+name = "IxBgpV1HxJhs"
+localIP = "127.0.0.1"
+localPort = 10001
+remotePort = 10001
+transport.useEncryption = true
+transport.useCompression = true
+
+[[proxies]]
+type = "udp"
+name = "IsKXTapPLnYD"
+localIP = "127.0.0.1"
+localPort = 10003
+remotePort = 10003
+transport.useEncryption = true
+transport.useCompression = true
+
+[[proxies]]
+type = "udp"
+name = "AGyPk6cBYVFy"
+localIP = "127.0.0.1"
+localPort = 10004
+remotePort = 10004
+transport.useEncryption = true
+transport.useCompression = true
+
+# --------------------------------------------------------------- Web 面板
+# 若也要远程打开管理面板，把下面这段的注释去掉（需在 frp 服务端再加一条 tcp 隧道）
+# [[proxies]]
+# type = "tcp"
+# name = "ec20-web-panel"
+# localIP = "127.0.0.1"
+# localPort = 8080
+# remotePort = 18080

@@ -4,6 +4,7 @@
     "port": 5060,
     "realm": "ec20sip.local",
     "external_ip": "",
+    "rtp_ports": [],
     "register_expiry": 3600,
     "max_extensions": 64
   },

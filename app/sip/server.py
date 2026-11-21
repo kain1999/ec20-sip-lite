@@ -582,6 +582,7 @@ class SipServer:
         self.bind = config.get("sip.bind", "0.0.0.0")
         self.port = int(config.get("sip.port", 5060))
         self.auth = digest.DigestAuth(config.get("sip.realm", "ec20sip.local"))
+        self.rtp_allocator = media.PortAllocator(config.get("sip.rtp_ports") or [])
         self.registrar = Registrar(self)
         self.calls = CallManager(self)
         self.legs = {}
@@ -732,4 +733,5 @@ class SipServer:
             "registrations": len([r for r in registrations if self.registrar.contact(r["number"])]),
             "extensions": len(self.db.list_extensions()),
             "active_calls": len(self.calls.calls),
+            "rtp": self.rtp_allocator.status(),
         }
