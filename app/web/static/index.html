@@ -1,117 +1,58 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="color-scheme" content="dark">
-<meta name="referrer" content="same-origin">
-<title>EC20 SIP 网关 · 管理台</title>
-<link rel="stylesheet" href="style.css">
+<title>EC20 SIP 网关</title>
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-
-<div class="boot" id="boot">
-  <div class="boot-dot"></div>
-  <span>正在连接网关…</span>
-</div>
-
-<div class="app" id="app" hidden>
-
-  <aside class="sidebar" id="sidebar">
-    <div class="brand">
-      <svg class="brand-icon" viewBox="0 0 24 24" width="24" height="24" aria-hidden="true">
-        <path d="M4.2 3h4.1l1.9 4.6-2.4 1.7a12.4 12.4 0 0 0 5.5 5.5l1.7-2.4L19.6 15v4.1a1.9 1.9 0 0 1-2 1.9A17.6 17.6 0 0 1 2.3 5a1.9 1.9 0 0 1 1.9-2z" fill="currentColor"/>
-      </svg>
-      <div class="brand-text">
-        <strong>EC20 SIP</strong>
-        <span>网关管理台</span>
-      </div>
-    </div>
-
-    <nav class="nav" id="nav" aria-label="主导航">
-      <a class="nav-item" href="#/dashboard" data-view="dashboard">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/></svg>
-        <span>概览</span>
-      </a>
-      <a class="nav-item" href="#/extensions" data-view="extensions">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
-        <span>分机</span>
-      </a>
-      <a class="nav-item" href="#/sms" data-view="sms">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 5h16v11H9.5L4 20.5V5z"/></svg>
-        <span>短信</span>
-      </a>
-      <a class="nav-item" href="#/rules" data-view="rules">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 6h16l-6 7.2V19l-4 2v-7.8L4 6z"/></svg>
-        <span>规则</span>
-      </a>
-      <a class="nav-item" href="#/settings" data-view="settings">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>
-        <span>设置</span>
-      </a>
-      <a class="nav-item" href="#/logs" data-view="logs">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M5.5 3.5h10l3.5 3.5v13.5h-13.5z"/><path d="M8.5 9h7M8.5 13h7M8.5 17h4"/></svg>
-        <span>日志</span>
-      </a>
+<div id="app">
+  <aside class="sidebar">
+    <div class="brand"><span class="dot"></span>EC20 SIP</div>
+    <nav>
+      <a href="#/dashboard" data-view="dashboard">概览</a>
+      <a href="#/extensions" data-view="extensions">分机</a>
+      <a href="#/sms" data-view="sms">短信</a>
+      <a href="#/rules" data-view="rules">转发规则</a>
+      <a href="#/settings" data-view="settings">设置</a>
+      <a href="#/logs" data-view="logs">日志</a>
     </nav>
-
-    <div class="side-foot">
-      <span id="side-version">v--</span>
-      <span class="side-foot-dim">本机静态界面</span>
-    </div>
+    <div class="sidebar-foot"><span id="ver">v1.0.0</span></div>
   </aside>
 
-  <div class="shell">
+  <main>
     <header class="topbar">
-      <h1 class="view-title" id="view-title">概览</h1>
-      <div class="topbar-right">
-        <span class="pill pill-off" id="modem-pill">
-          <span class="pill-dot"></span>
-          <span id="modem-pill-text">离线</span>
-        </span>
-        <div class="bars" id="signal-bars" title="信号强度" aria-label="信号强度">
-          <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
-        </div>
-        <span class="topbar-meta" id="call-count">通话中 0</span>
-        <button class="btn btn-ghost" id="btn-refresh" type="button">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true" width="16" height="16"><path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4v4.2h-4.2"/></svg>
-          <span>刷新</span>
-        </button>
+      <div class="top-items">
+        <span id="pill" class="pill offline">离线</span>
+        <span class="signal"><i></i><i></i><i></i><i></i><i></i></span>
+        <span id="callcount" class="chip">通话中 0</span>
+        <span id="meminfo" class="chip">内存 -</span>
+      </div>
+      <div class="top-actions">
+        <button class="btn ghost" data-action="refresh">刷新</button>
+        <button class="btn ghost" data-action="logout">退出</button>
       </div>
     </header>
-
-    <main class="main" id="main" tabindex="-1"></main>
-  </div>
+    <section id="view" class="view"></section>
+  </main>
 </div>
 
-<div class="overlay" id="login-overlay" hidden>
-  <form class="login-card" id="login-form" autocomplete="off">
-    <h2>登录管理台</h2>
-    <p class="hint">凭据保存在网关本地，仅本机校验</p>
-    <label class="field" for="login-user"><span>用户名</span>
-      <input class="input" id="login-user" name="username" value="admin" autocomplete="username" spellcheck="false" required>
-    </label>
-    <label class="field" for="login-pass"><span>密码</span>
-      <input class="input" id="login-pass" name="password" type="password" autocomplete="current-password" required>
-    </label>
-    <p class="login-err" id="login-err" hidden></p>
-    <button class="btn btn-primary btn-block" type="submit">登 录</button>
+<div id="toasts" class="toasts"></div>
+
+<div id="login" class="overlay hidden">
+  <form id="loginform" class="dialog small">
+    <h2>登录管理面板</h2>
+    <label>用户名<input id="login-user" autocomplete="username" value="admin"></label>
+    <label>密码<input id="login-pass" type="password" autocomplete="current-password"></label>
+    <div class="row end">
+      <button class="btn primary" type="submit">登录</button>
+    </div>
+    <p id="login-err" class="err"></p>
   </form>
 </div>
 
-<div class="modal-backdrop" id="modal" hidden>
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
-    <header class="modal-head">
-      <h2 id="modal-title">提示</h2>
-      <button class="icon-btn" id="modal-x" type="button" aria-label="关闭">&times;</button>
-    </header>
-    <div class="modal-body" id="modal-body"></div>
-    <footer class="modal-foot" id="modal-foot"></footer>
-  </div>
-</div>
-
-<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
-
-<script src="app.js"></script>
+<div id="modal" class="overlay hidden"><div class="dialog" id="modalbody"></div></div>
+<script src="/static/app.js"></script>
 </body>
 </html>
