@@ -86,7 +86,21 @@ python3 -m app.main --sim                 # 无硬件模拟模式（面板、SIP
 python3 -m app.main -c /etc/ec20-sip/config.json
 python3 -m app.main --print-password      # 重置并打印管理密码
 python3 tools/sip_probe.py --server 192.168.1.188:5060 --user 1001 --password xxx --invite 1002
-python3 -m unittest discover -s tests -v  # 22 个单元/集成测试
+python3 tools/auto_answer.py --server 127.0.0.1:5060 --user 1002 --password xxx --hold 8
+python3 tools/webhook_sink.py 18099       # 本地 webhook 接收器，验证短信转发
+python3 tools/db_dump.py /var/lib/ec20-sip/ec20sip.db
+python3 tools/check_api.py                # 面板调用的接口是否都存在
+node tools/check_ui.js                    # 面板 id / action 是否自洽（需 node）
+python3 -m unittest discover -s tests -v  # 23 个单元/集成测试
+```
+
+模拟模式下额外提供两个调试接口（真实模块运行时不开放）：
+
+```sh
+curl -X POST -H 'Content-Type: application/json' -d '{"number":"13800138000"}' \
+     -b cookies.txt http://127.0.0.1:8080/api/sim/incoming     # 触发一通来电
+curl -X POST -H 'Content-Type: application/json' -d '{"peer":"10001","text":"验证码 123456"}' \
+     -b cookies.txt http://127.0.0.1:8080/api/sim/sms          # 触发一条进来的短信
 ```
 
 ## 配置文件
