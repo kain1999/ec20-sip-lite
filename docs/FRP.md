@@ -1,18 +1,35 @@
-# FRP 穿透配置（SIP + RTP）
+# FRP 穿透配置（SIP over TCP + RTP over UDP）
 
-盒子在运营商/家庭 NAT 后面时，用 frp 把 SIP 与 RTP 暴露到公网服务器。
-本项目的 frp 相关文件：
+本项目 SIP **只监听 TCP**，RTP 仍是 UDP。这个组合是被 frp 的语义逼出来的，也是它的最优解：
 
-| 文件 | 作用 |
-| --- | --- |
-| `packaging/frpc.toml` | 5 条 udp 隧道（5060 + 10000/10001/10003/10004） |
-| `packaging/frpc.service` | frpc 的 systemd 单元（`MemoryMax=80M`） |
-| `/etc/ec20-sip/config.json` → `sip.rtp_ports` | 把 RTP 锁到隧道映射的那几个端口 |
+| 用途 | 隧道类型 | 端口 | 原因 |
+| --- | --- | --- | --- |
+| SIP 信令 | **tcp** | 5060 | TCP 是长连接，一条隧道可承载任意多个分机；服务端能沿连接反向发 INVITE/BYE |
+| RTP 媒体 | **udp** | 10000/10001/10003/10004 | RTP 协议本身是 UDP，`type="tcp"` 隧道转发不了 |
 
-## 一、必须同时改的两处
+## 一、为什么 SIP 必须 TCP（一对一多）
 
-frp 只映射固定端口，而本项目默认用**系统临时端口**跑 RTP。只配 frp 不改 `rtp_ports`
-的结果是：信令通、音频单通（因为你听到对方、对方听不到你）。
+frp 的 `type="udp"` 是单向的：只有外部客户端先发包才能建立会话。实测（UDP 版）：
+
+```
+register 1003 -> 200 OK
+caller <- 100 Trying
+caller <- 180 Ringing
+callee received: nothing          <- 服务端主动 INVITE 送不到 NAT 后的分机
+```
+
+换成 TCP 后同一条探针（`tools/probe_nat_call.py`，走公网 `8.137.213.214:5060`）：
+
+```
+caller <- 100 Trying
+caller <- 180 Ringing
+callee received: INVITE from <sip:1001@8.137.213.214>;tag=2845d6196fc0
+RESULT: server->callee reachable = True
+```
+
+所以：**一条 5060/tcp 隧道 = 任意多台分机同时注册 + 互打 + 被外线呼入**。
+
+## 二、必须同步的两处配置
 
 ```json
 // /etc/ec20-sip/config.json
@@ -25,75 +42,54 @@ frp 只映射固定端口，而本项目默认用**系统临时端口**跑 RTP�
 }
 ```
 
-`external_ip` 填 frp 服务器的公网地址：SDP 里必须通告这个地址，否则对方会把音频发到
-盒子的内网 IP。改完 `systemctl restart ec20-sip`。
+- `external_ip`：公网地址，写进 SDP 的 `c=` 行，否则对方把音频发到内网 IP。
+  （本项目会按对端来源自动选择：内网分机仍通告内网 IP，不绕公网。）
+- `rtp_ports`：RTP 端口池，**每路通话消耗 2 个**（主叫腿 + 被叫腿各一个）。
+  4 个端口 = 2 路并发；要 4 路并发就再加 4 个 udp 隧道并扩展这个列表。
 
-验证：
+改完 `systemctl restart ec20-sip`，验证：
 
 ```sh
 curl -s http://127.0.0.1:8080/api/status | python3 -c "import json,sys;print(json.load(sys.stdin)['sip'])"
-# {"listening": "8.137.213.214:5060", ..., "rtp": {"ports": [10000,10001,10003,10004], "in_use": []}}
+# {'listening': '8.137.213.214:5060', 'rtp': {'ports': [...], 'in_use': [...]}}
+ss -tlnp | grep 5060        # TCP
+ss -lunp | grep 1000        # UDP，仅通话期间出现
 ```
 
-通话期间 `in_use` 会出现占用的端口，`ss -lunp | grep 1000` 能看到绑定。
+## 三、frp 端
 
-## 二、frp UDP 的方向性限制（重要）
-
-frp 的 `type="udp"` 是**反向隧道**：外部客户端先发包 → frps 建立工作连接 → 转发到盒子。
-因此：
-
-| 场景 | 是否可用 | 原因 |
-| --- | --- | --- |
-| 外部分机向盒子 REGISTER | ✅ | 客户端先发包，隧道已建立 |
-| 外部分机呼入（打外线、打内部分机） | ✅ | 同上，信令由客户端发起 |
-| 通话中的音频（双向） | ✅ | 双方都在持续发包，隧道活跃 |
-| **盒子主动呼叫外部分机**（含 EC20 外线来电群振） | ❌ | 服务端要发起全新的 UDP 会话，frpc 侧没有对应 socket |
-| 外部分机之间的互打 | ❌ | 需要服务端向被叫发起 INVITE |
-
-实测（`tools/probe_nat_call.py`，走公网 `8.137.213.214:5060`）：
-
-```
-register 1003 -> 200 OK (contact host 0.0.0.0)
-caller <- 100 Trying
-caller <- 180 Ringing
-callee received: nothing            <- 服务端无法把 INVITE 送到 NAT 后的分机
-RESULT: server->callee reachable = False
-```
-
-这不是配置错误，是 UDP 反向代理的固有语义：服务端往 `127.0.0.1:<源端口>` 发的包，
-frpc 上没有监听者，直接丢弃。
-
-## 三、要让盒子能呼通远程分机，选一个
-
-### 方案 A：Tailscale / WireGuard（推荐，盒子已装 tailscale）
-
-远程手机加入同一 tailnet，直接访问盒子内网地址 `sip:1003@100.x.x.x:5060`。
-SIP 与 RTP 全双向，不需要 frp，也不消耗公网带宽。frp 可以只留 Web 面板隧道。
+用 `packaging/frpc.toml`（5060 一条 tcp + 4 条 udp）。启动与自检：
 
 ```sh
-# 盒子
-tailscale up            # 或用 /opt/tailscale 里的现成配置
-tailscale ip -4         # 得到 100.x.y.z，把它填进话机的 SIP 服务器地址
+frpc verify -c /etc/frp/frpc.toml
+systemctl restart frpc
+journalctl -u frpc --since '-2min' | grep -c 'start proxy success'   # 应为隧道条数
 ```
 
-### 方案 B：frp 的 tcp 隧道 + SIP over TCP
+## 四、分机（话机/软电话）配置
 
-TCP 有连接可复用，服务端可以沿已建立连接发 INVITE，双向都通。
-需要在 frp 服务端新增一条 `type = "tcp"` 隧道，并在本项目启用 TCP 监听
-（当前版本只监听 UDP，需要额外开发）。
+必须支持 **SIP over TCP**：
 
-### 方案 C：只做"呼入"用途
+```
+服务器: 8.137.213.214
+端口:   5060
+传输:   TCP          ← 关键，不能选 UDP
+账号:   1002
+密码:   123456
+域名:   ec20sip.local（或 8.137.213.214）
+```
 
-如果远程分机只需要**打出去**（拨外线、拨内部分机），保持现在的 UDP 隧道即可；
-但要接受"别人打不进来、外线来电不会振铃到该分机"。
+不支持 TCP 的老话机：在 `config.json` 里设 `"sip": {"enable_udp": true}` 并重启，
+它就能走 UDP（但只能呼出，服务端呼不回来——见第一节）。
 
-## 四、常见故障对应
+## 五、故障对照
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
-| `frpc verify` 报语法错 | 0.65 只认 TOML，旧 ini 语法不行 | 用 `packaging/frpc.toml` |
-| 注册成功但拨号无响应 | 隧道名/远端端口在 frps 侧未放行 | 看 `journalctl -u frpc` 有无 `start proxy success` |
-| 能听到对方、对方听不到 | RTP 用了随机端口 | 配 `sip.rtp_ports` = 隧道端口列表 |
-| 能听到对方、对方听不到（已配 rtp_ports） | `sip.external_ip` 没改成公网地址 | SDP 通告了内网 IP |
-| 呼叫外部分机超时 | frp UDP 方向性限制 | 见「三」，换 Tailscale 或 TCP |
-| 日志 `rtp port 10000 unavailable` | 端口被别的进程占用 | `ss -lunp \| grep 1000` 查占用者 |
+| `frpc verify` 报语法错 | 0.65 只认 TOML | 用 `packaging/frpc.toml` |
+| 注册成功但无声音 | RTP 用了随机端口 | 配 `sip.rtp_ports` 与隧道一致 |
+| 无声音且通话中 RTP 端口没被占用 | `external_ip` 没改成公网地址 | SDP 通告了内网 IP |
+| 外部分机能呼出、不能呼入 | 只开了 UDP（`enable_udp=true`） | 话机改 TCP 传输 |
+| 第 3 路通话开始失败 | `rtp_ports` 不够（每路 2 个） | 加端口 + 加 udp 隧道 |
+| `rtp port 10000 unavailable` | 端口被别的进程占用 | `ss -lunp \| grep 1000` |
+| 挂断后对端还在通话 | 老版本（UAS 侧不发 BYE） | 升级到当前版本，已修复 |

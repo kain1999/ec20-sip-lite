@@ -1,9 +1,8 @@
-"""SIP smoke-test client: REGISTER / OPTIONS / INVITE against an ec20-sip-lite box.
+"""SIP/TCP smoke test: REGISTER / OPTIONS / INVITE / hangup observation.
 
-Usage:
-    python tools/sip_probe.py --server 192.168.1.188:5060 --user 1001 --password 1001pass
-    python tools/sip_probe.py ... --invite 1002      # place an extension-to-extension call
-    python tools/sip_probe.py ... --invite 910000    # dial out through the EC20
+    python tools/sip_probe.py --server 8.137.213.214:5060 --user 1001 --password 123456
+    python tools/sip_probe.py ... --invite 1002                 # place a call
+    python tools/sip_probe.py ... --invite 1002 --hold 10       # wait for the BYE
 """
 from __future__ import annotations
 
@@ -15,34 +14,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.sip import digest, message as sipmsg, sdp  # noqa: E402
-
-
-class Client(asyncio.DatagramProtocol):
-    def __init__(self):
-        self.queue = asyncio.Queue()
-        self.transport = None
-        self.port = 0
-
-    def connection_made(self, transport):
-        self.transport = transport
-        self.port = transport.get_extra_info("sockname")[1]
-
-    def datagram_received(self, data, addr):
-        try:
-            self.queue.put_nowait(sipmsg.SipMessage.parse(data))
-        except ValueError:
-            pass
-
-    def send(self, message, addr):
-        self.transport.sendto(message.to_bytes(), addr)
-
-    async def recv(self, timeout=4.0):
-        return await asyncio.wait_for(self.queue.get(), timeout)
-
-
-def branch():
-    return "z9hG4bK" + secrets.token_hex(6)
+from app.sip import message as sipmsg, sdp  # noqa: E402
+from tools.tcp_ua import Ua, branch         # noqa: E402
 
 
 async def main():
@@ -52,148 +25,102 @@ async def main():
     parser.add_argument("--password", required=True)
     parser.add_argument("--invite", default="")
     parser.add_argument("--hold", type=float, default=0.0,
-                        help="after answering, wait N seconds for a BYE from the server")
-    parser.add_argument("--local-ip", default="")
+                        help="after the call is up, wait N seconds for the server's BYE")
+    parser.add_argument("--contact-host", default="0.0.0.0")
     args = parser.parse_args()
 
     host, _, port_s = args.server.partition(":")
     port = int(port_s or 5060)
-    server = (host, port)
-    loop = asyncio.get_running_loop()
-    transport, client = await loop.create_datagram_endpoint(Client, local_addr=("0.0.0.0", 0))
-    local_ip = args.local_ip or transport.get_extra_info("sockname")[0]
-    if local_ip.startswith("0.0.0.0"):
-        local_ip = "127.0.0.1"
-    uri = "sip:%s:%d" % (host, port)
-
-    # ------------------------------------------------------------- REGISTER
-    call_id = "%s@probe" % secrets.token_hex(4)
-    contact = "<sip:%s@%s:%d;transport=udp>" % (args.user, local_ip, client.port)
-
-    def register_request(cseq, extra=None, tag=None):
-        headers = [
-            ("Via", "SIP/2.0/UDP %s:%d;branch=%s;rport" % (local_ip, client.port, branch())),
-            ("Max-Forwards", "70"),
-            ("From", "<sip:%s@%s>;tag=%s" % (args.user, host, tag or "probe")),
-            ("To", "<sip:%s@%s>" % (args.user, host)),
-            ("Call-ID", call_id),
-            ("CSeq", "%d REGISTER" % cseq),
-            ("Contact", contact),
-            ("Expires", "300"),
-            ("User-Agent", "sip_probe/1.0"),
-        ]
-        headers.extend(extra or [])
-        return sipmsg.build_request("REGISTER", uri, headers=headers)
-
-    client.send(register_request(1), server)
-    first = await client.recv()
-    print("REGISTER #1 ->", first.status, first.reason)
-    if first.status == 401:
-        challenge = digest.parse_challenge(first.get("WWW-Authenticate").replace("Digest ", ""))
-        params = dict(challenge)
-        params.update({"nc": "00000001", "cnonce": secrets.token_hex(4)})
-        response = digest.compute_response(args.user, args.password, "REGISTER", uri, params)
-        header = ('Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", '
-                  'algorithm=MD5, qop=auth, nc=%s, cnonce=%s'
-                  % (args.user, challenge["realm"], challenge["nonce"], uri, response,
-                     params["nc"], params["cnonce"]))
-        client.send(register_request(2, [("Authorization", header)]), server)
-        second = await client.recv()
-        print("REGISTER #2 ->", second.status, second.reason)
-        if second.status != 200:
+    ua = await Ua(args.user).connect(host, port)
+    try:
+        reply = await ua.register(host, port, args.user, args.password,
+                                  contact_host=args.contact_host)
+        print("REGISTER ->", reply.status, reply.reason)
+        if reply.status != 200:
             print("registration failed")
             return 1
 
-    # -------------------------------------------------------------- OPTIONS
-    options = sipmsg.build_request("OPTIONS", uri, headers=[
-        ("Via", "SIP/2.0/UDP %s:%d;branch=%s;rport" % (local_ip, client.port, branch())),
-        ("From", "<sip:%s@%s>;tag=%s" % (args.user, host, secrets.token_hex(3))),
-        ("To", "<sip:%s@%s>" % (host, host)),
-        ("Call-ID", "%s@probe" % secrets.token_hex(4)), ("CSeq", "1 OPTIONS"),
-    ])
-    client.send(options, server)
-    reply = await client.recv()
-    print("OPTIONS ->", reply.status, reply.reason, "|", reply.get("Allow", ""))
+        ua.send(sipmsg.build_request("OPTIONS", "sip:%s:%d" % (host, port), headers=[
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (args.contact_host, ua.port, branch())),
+            ("From", "<sip:%s@%s>;tag=%s" % (args.user, host, secrets.token_hex(3))),
+            ("To", "<sip:%s@%s>" % (host, host)),
+            ("Call-ID", "%s@probe" % secrets.token_hex(4)), ("CSeq", "1 OPTIONS"),
+        ]))
+        reply = await ua.recv()
+        print("OPTIONS ->", reply.status, "|", reply.get("Allow", ""))
 
-    if not args.invite:
-        transport.close()
-        return 0
+        if not args.invite:
+            return 0
 
-    # --------------------------------------------------------------- INVITE
-    invite_call_id = "%s@probe" % secrets.token_hex(4)
-    rtp_probe = 40000 + (client.port % 500)
-    body = sdp.build_sdp(local_ip, rtp_probe)
-    invite_headers = [
-        ("Via", "SIP/2.0/UDP %s:%d;branch=%s;rport" % (local_ip, client.port, branch())),
-        ("Max-Forwards", "70"),
-        ("From", "<sip:%s@%s>;tag=%s" % (args.user, host, secrets.token_hex(3))),
-        ("To", "<sip:%s@%s>" % (args.invite, host)),
-        ("Call-ID", invite_call_id), ("CSeq", "1 INVITE"),
-        ("Contact", contact), ("Content-Type", "application/sdp"),
-    ]
-    invite = sipmsg.build_request("INVITE", "sip:%s@%s:%d" % (args.invite, host, port),
-                                  headers=invite_headers, body=body)
-    client.send(invite, server)
-    print("INVITE ->", args.invite)
-    final = None
-    for _ in range(8):
-        try:
-            message = await client.recv(timeout=6.0)
-        except asyncio.TimeoutError:
-            print("no further response")
-            break
-        if message.is_request:
-            print("  <- request", message.method)
-            continue
-        print("  <-", message.status, message.reason)
-        if message.status >= 200:
-            final = message
-            break
-
-    if final is not None and final.status < 300:
-        client.send(sipmsg.build_request("ACK", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
-            ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (local_ip, client.port, branch())),
+        call_id = "%s@probe" % secrets.token_hex(4)
+        from_header = "<sip:%s@%s>;tag=%s" % (args.user, host, secrets.token_hex(3))
+        ua.send(sipmsg.build_request("INVITE", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (args.contact_host, ua.port, branch())),
             ("Max-Forwards", "70"),
-            ("From", invite_headers[2][1]),
-            ("To", final.get("To")),
-            ("Call-ID", invite_call_id), ("CSeq", "1 ACK"),
-            ("Content-Length", "0"),
-        ]), server)
+            ("From", from_header),
+            ("To", "<sip:%s@%s>" % (args.invite, host)),
+            ("Call-ID", call_id), ("CSeq", "1 INVITE"),
+            ("Contact", "<sip:%s@%s:%d;transport=tcp>" % (args.user, args.contact_host, ua.port)),
+            ("Content-Type", "application/sdp"),
+        ], body=sdp.build_sdp(args.contact_host, 40000)))
+        print("INVITE ->", args.invite)
 
-        if args.hold > 0:
-            print("holding %.0fs, waiting for the server to hang up..." % args.hold)
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + args.hold
-            got_bye = False
-            while loop.time() < deadline:
-                try:
-                    message = await client.recv(timeout=deadline - loop.time())
-                except asyncio.TimeoutError:
-                    break
-                if message.is_request and message.method == "BYE":
-                    client.send(sipmsg.build_response(message, 200, "OK"), server)
-                    print("  <- BYE after %.1fs  [OK: server hung up]"
-                          % (args.hold - (deadline - loop.time())))
-                    got_bye = True
-                    break
-            if not got_bye:
-                print("  no BYE received  [BUG: the other side was not told]")
-            transport.close()
-            return 0 if got_bye else 1
+        final = None
+        for _ in range(8):
+            try:
+                message = await ua.recv(timeout=6)
+            except asyncio.TimeoutError:
+                print("no further response")
+                break
+            if message.is_request:
+                print("  <- request", message.method)
+                continue
+            print("  <-", message.status, message.reason)
+            if message.status >= 200:
+                final = message
+                break
 
-    client.send(sipmsg.build_request("BYE", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
-        ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (local_ip, client.port, branch())),
-        ("From", "<sip:%s@%s>;tag=probe" % (args.user, host)),
-        ("To", "<sip:%s@%s>;tag=probe" % (args.invite, host)),
-        ("Call-ID", invite_call_id), ("CSeq", "2 BYE"),
-    ]), server)
-    try:
-        bye = await client.recv(timeout=3)
-        print("BYE ->", bye.status, bye.reason)
-    except asyncio.TimeoutError:
-        print("BYE -> no answer")
-    transport.close()
-    return 0
+        if final is not None and final.status < 300:
+            ua.send(sipmsg.build_request("ACK", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
+                ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (args.contact_host, ua.port, branch())),
+                ("Max-Forwards", "70"),
+                ("From", from_header),
+                ("To", final.get("To")),
+                ("Call-ID", call_id), ("CSeq", "1 ACK"), ("Content-Length", "0"),
+            ]))
+            if args.hold > 0:
+                print("holding %.0fs, waiting for the server to hang up..." % args.hold)
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + args.hold
+                got_bye = False
+                while loop.time() < deadline:
+                    try:
+                        message = await ua.recv(timeout=deadline - loop.time())
+                    except asyncio.TimeoutError:
+                        break
+                    if message.is_request and message.method == "BYE":
+                        ua.send(sipmsg.build_response(message, 200, "OK"))
+                        print("  <- BYE  [OK: the other side hung up]")
+                        got_bye = True
+                        break
+                if not got_bye:
+                    print("  no BYE received [the other side was not told]")
+                return 0 if got_bye else 1
+
+        ua.send(sipmsg.build_request("BYE", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (args.contact_host, ua.port, branch())),
+            ("From", from_header),
+            ("To", "<sip:%s@%s>;tag=probe" % (args.invite, host)),
+            ("Call-ID", call_id), ("CSeq", "2 BYE"),
+        ]))
+        try:
+            bye = await ua.recv(timeout=3)
+            print("BYE ->", bye.status, bye.reason)
+        except asyncio.TimeoutError:
+            print("BYE -> no answer")
+        return 0
+    finally:
+        ua.close()
 
 
 if __name__ == "__main__":

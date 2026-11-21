@@ -41,6 +41,9 @@ class SipLeg:
         self.pending_request = None
         self.media = media.RtpPort(server.loop, on_dtmf=self._on_dtmf,
                                    allocator=getattr(server, "rtp_allocator", None))
+        # address used in Via/Contact/SDP: LAN ip for LAN peers, public ip for
+        # remote peers (frp). Filled in by accept()/invite().
+        self.advert_ip = server.media_ip if server else ""
         self._retransmit_task = None
         self._answered_200 = None
         self.last_error = ""
@@ -68,6 +71,7 @@ class SipLeg:
         self.call_id = request.call_id
         self.remote_tag = request.from_tag
         self.remote_target = peer
+        self.advert_ip = self.server.media_ip_for(peer.ip)
         self.remote_sdp = sdp.parse_sdp(request.body)
         self.state = "invited"
         await self.media.open()
@@ -91,9 +95,9 @@ class SipLeg:
     def answer(self):
         if self.state not in ("invited", "ringing"):
             return False
-        body = sdp.build_sdp(self.server.media_ip, self.media.port, seed=self.call_id)
+        body = sdp.build_sdp(self.advert_ip, self.media.port, seed=self.call_id)
         headers = [
-            ("Contact", "<sip:box@%s:%d>" % (self.server.media_ip, self.server.port)),
+            ("Contact", "<sip:box@%s:%d>" % (self.advert_ip, self.server.port)),
             ("Content-Type", "application/sdp"),
             ("Allow", ALLOW),
         ]
@@ -157,21 +161,22 @@ class SipLeg:
 
     # ------------------------------------------------------------------- UAC
     async def invite(self, target_user, host, port, from_user="box", display="EC20 Gateway"):
-        self.call_id = "%s@%s" % (secrets.token_hex(8), self.server.media_ip)
+        self.advert_ip = self.server.media_ip_for(host)
+        self.call_id = "%s@%s" % (secrets.token_hex(8), self.advert_ip)
         self.state = "inviting"
         self.remote_target = await self.server.outbound_peer(target_user, host, int(port or 5060))
         await self.media.open()
-        body = sdp.build_sdp(self.server.media_ip, self.media.port, seed=self.call_id)
-        contact = "<sip:%s@%s:%d>" % (from_user, self.server.media_ip, self.server.port)
+        body = sdp.build_sdp(self.advert_ip, self.media.port, seed=self.call_id)
+        contact = "<sip:%s@%s:%d;transport=tcp>" % (from_user, self.advert_ip, self.server.port)
         uri = "sip:%s@%s:%d" % (target_user, host, int(port or 5060))
         # the caller's identity is the bare extension number: no stale display
         # name from the phone can leak into the other party's screen
-        from_header = ("<sip:%s@%s>;tag=%s" % (from_user, self.server.media_ip, self.local_tag)
+        from_header = ("<sip:%s@%s>;tag=%s" % (from_user, self.advert_ip, self.local_tag)
                        if not display or display == from_user
                        else "\"%s\" <sip:%s@%s>;tag=%s" % (display, from_user,
-                                                           self.server.media_ip, self.local_tag))
+                                                           self.advert_ip, self.local_tag))
         request = sipmsg.build_request("INVITE", uri, headers=[
-            ("Via", "SIP/2.0/UDP %s:%d;branch=%s;rport" % (self.server.media_ip, self.server.port, branch())),
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s;rport" % (self.advert_ip, self.server.port, branch())),
             ("Max-Forwards", "70"),
             ("From", from_header),
             ("To", "<sip:%s@%s>" % (target_user, host)),
@@ -236,7 +241,7 @@ class SipLeg:
     def _send_ack(self, response):
         ack = sipmsg.build_request("ACK", self.pending_request.uri if self.pending_request else "",
                                    headers=[
-            ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (self.server.media_ip, self.server.port, branch())),
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (self.advert_ip, self.server.port, branch())),
             ("Max-Forwards", "70"),
             ("From", self.pending_request.get("From")),
             ("To", response.get("To")),
@@ -269,11 +274,11 @@ class SipLeg:
             return
         self.local_cseq += 1
         bye = sipmsg.build_request("BYE", self.pending_request.uri if self.pending_request else
-                                   "sip:%s@%s" % (self.user, self.server.media_ip), headers=[
-            ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (self.server.media_ip, self.server.port, branch())),
+                                   "sip:%s@%s" % (self.user, self.advert_ip), headers=[
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (self.advert_ip, self.server.port, branch())),
             ("Max-Forwards", "70"),
             ("From", self.pending_request.get("From")),
-            ("To", "<sip:%s@%s>;tag=%s" % (self.user, self.server.media_ip, self.remote_tag)),
+            ("To", "<sip:%s@%s>;tag=%s" % (self.user, self.advert_ip, self.remote_tag)),
             ("Call-ID", self.call_id),
             ("CSeq", "%d BYE" % self.local_cseq),
             ("Content-Length", "0"),
@@ -302,9 +307,9 @@ class SipLeg:
             to_value = "%s;tag=%s" % (to_value, self.remote_tag)
         self.local_cseq += 1
         bye = sipmsg.build_request("BYE", target_uri, headers=[
-            ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (self.server.media_ip, self.server.port, branch())),
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (self.advert_ip, self.server.port, branch())),
             ("Max-Forwards", "70"),
-            ("From", "<sip:%s@%s>;tag=%s" % (self.user or "box", self.server.media_ip,
+            ("From", "<sip:%s@%s>;tag=%s" % (self.user or "box", self.advert_ip,
                                              self.local_tag)),
             ("To", to_value),
             ("Call-ID", self.call_id),
@@ -332,7 +337,7 @@ class SipLeg:
             return
         self.local_cseq += 1
         cancel = sipmsg.build_request("CANCEL", self.pending_request.uri, headers=[
-            ("Via", "SIP/2.0/UDP %s:%d;branch=%s" % (self.server.media_ip, self.server.port, branch())),
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (self.advert_ip, self.server.port, branch())),
             ("Max-Forwards", "70"),
             ("From", self.pending_request.get("From")),
             ("To", self.pending_request.get("To")),
