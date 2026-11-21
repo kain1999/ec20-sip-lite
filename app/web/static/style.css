@@ -52,7 +52,10 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:middle}
 th{color:var(--dim);font-weight:600;font-size:12px}
 tbody tr:hover{background:var(--bg3)}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere}
+.row>span{min-width:0;overflow-wrap:anywhere}
+.card,.grid>*,main,.view{min-width:0}
+body{overflow-x:hidden}
 .tag{display:inline-block;border-radius:6px;padding:1px 7px;font-size:11px;border:1px solid var(--line);color:var(--dim)}
 .tag.ok{color:var(--ok);border-color:rgba(46,204,113,.4)}
 .tag.err{color:var(--err);border-color:rgba(239,83,80,.4)}
@@ -86,9 +89,22 @@ tbody tr:hover{background:var(--bg3)}
   .brand,.sidebar-foot{display:none}
   .sidebar nav{flex-direction:row;gap:4px}
   .sidebar nav a{padding:8px 10px;font-size:12px;white-space:nowrap}
-  main{padding-bottom:64px}
-  .grid.c4,.grid.c2,.form-grid{grid-template-columns:1fr 1fr}
-  .grid.c4>*:nth-child(n+3){grid-column:span 2}
+  main{padding-bottom:64px;min-width:0;width:100%}
   .topbar{padding:8px 10px}
-  .view{padding:10px}
+  .top-items{gap:6px}
+  .topbar .chip{display:none}
+  .view{padding:10px;gap:10px;overflow-x:hidden}
+  .grid.c4,.grid.c2{grid-template-columns:minmax(0,1fr)}
+  .grid.c4>*:nth-child(n+3){grid-column:auto}
+  .form-grid{grid-template-columns:minmax(0,1fr)}
+  .card{padding:12px;min-width:0;overflow:hidden}
+  .row.between>span:last-child{max-width:62%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+  .mono{font-size:11px}
+  .dialpad{max-width:100%;grid-template-columns:repeat(3,minmax(0,1fr))}
+  .dialpad button{padding:10px 0;font-size:16px}
+  table{display:block;overflow-x:auto;white-space:nowrap}
+  th,td{padding:7px 5px}
+  .sms-head{flex-wrap:wrap}
+  .dialog{padding:14px}
+  .kpi{font-size:19px}
 }

@@ -235,8 +235,11 @@
       '<div class="card"><h3>新增分机</h3><div class="row" style="align-items:flex-end">',
       '<label style="width:110px">分机号<input id="ext-number" placeholder="1001"></label>',
       '<label style="flex:1;min-width:120px">名称<input id="ext-name" placeholder="前台"></label>',
-      '<label style="width:180px">密码（留空自动生成）<input id="ext-pass" placeholder="自动生成 8 位"></label>',
-      '<button class="btn primary" data-action="ext-add">添加</button></div></div>',
+      '<label style="width:170px">密码（留空自动生成）<input id="ext-pass" placeholder="自动生成 8 位"></label>',
+      '<label style="width:220px">振铃组（可为空）<input id="ext-ring" placeholder="1001&1002&1003"></label>',
+      '<button class="btn primary" data-action="ext-add">添加</button></div>',
+      '<p class="muted" style="margin:8px 0 0">振铃组：把几个分机用 <b>&amp;</b> 串起来，任何一个被叫（分机或 EC20 外线）时组成员一起振铃；' +
+      '谁先接听谁通话，其余自动挂断/取消，不影响其他分机。</p></div>',
       '<div class="card"><h3>分机列表</h3><div id="ext-table" class="muted">加载中…</div></div>'
     ].join('');
   }
@@ -246,16 +249,20 @@
     if (!box) return;
     if (!S.ext.length) { box.textContent = '还没有分机，先添加一个。'; return; }
     box.classList.remove('muted');
-    box.innerHTML = '<table><thead><tr><th>分机号</th><th>名称</th><th>密码</th><th>状态</th><th>来源</th><th>操作</th></tr></thead><tbody>' +
+    box.innerHTML = '<table><thead><tr><th>分机号</th><th>名称</th><th>密码</th><th>状态</th><th>振铃组</th><th>来源</th><th>操作</th></tr></thead><tbody>' +
       S.ext.map(function (e) {
         var shown = S.revealed[e.id] ? e.password : '••••••';
         var state = !e.enabled ? '<span class="tag err">停用</span>'
           : (e.registered ? '<span class="tag ok">在线</span>' : '<span class="tag">未注册</span>');
+        var members = e.ring_members || [e.number];
+        var ring = members.length > 1
+          ? '<span class="tag ok">' + esc(members.join(' & ')) + '</span>'
+          : '<span class="muted">-</span>';
         return '<tr><td class="mono">' + esc(e.number) + '</td><td>' + esc(e.display_name) + '</td>' +
           '<td class="mono">' + esc(shown) +
           ' <button class="btn sm ghost" data-action="ext-reveal" data-id="' + e.id + '">' + (S.revealed[e.id] ? '隐藏' : '显示') + '</button>' +
           ' <button class="btn sm ghost" data-action="ext-copy" data-id="' + e.id + '">复制</button></td>' +
-          '<td>' + state + '</td><td class="mono muted">' + esc(e.contact || '-') + '</td>' +
+          '<td>' + state + '</td><td>' + ring + '</td><td class="mono muted">' + esc(e.contact || '-') + '</td>' +
           '<td><button class="btn sm" data-action="ext-kick" data-id="' + e.id + '">踢下线</button> ' +
           '<button class="btn sm" data-action="ext-edit" data-id="' + e.id + '">编辑</button> ' +
           '<button class="btn sm danger" data-action="ext-del" data-id="' + e.id + '">删除</button></td></tr>';
@@ -285,6 +292,8 @@
       '<label>状态<select id="m-ext-enabled"><option value="1"' + (e.enabled ? ' selected' : '') + '>启用</option>' +
       '<option value="0"' + (e.enabled ? '' : ' selected') + '>停用</option></select></label>',
       '<label>呼叫转移至<input id="m-ext-forward" value="' + esc(e.forward_to || '') + '" placeholder="留空不转移"></label>',
+      '<label style="grid-column:span 2">振铃组（用 &amp; 连接分机号，例如 1001&amp;1002&amp;1003）' +
+      '<input id="m-ext-ring" value="' + esc(e.ring_group || '') + '" placeholder="留空表示只响本机"></label>',
       '</div>',
       '<div class="row end"><button class="btn ghost" data-action="modal-close">取消</button>',
       '<button class="btn primary" data-action="ext-save" data-id="' + e.id + '">保存</button></div>'
@@ -443,7 +452,12 @@
       '<label>SIP 端口<input id="s-sip-port" placeholder="5060"></label>',
       '</div><div class="row end" style="margin-top:10px"><button class="btn primary" data-action="save-dial">保存</button></div></div>',
 
-      '<div class="card"><h3>管理账号</h3><div class="form-grid">',
+      '<div class="card"><h3>管理账号</h3>',
+      '<div class="row" style="margin-bottom:10px;padding:8px 10px;background:var(--bg3);border-radius:8px">' +
+      '<label style="flex-direction:row;align-items:center;gap:8px;flex:1">' +
+      '<input type="checkbox" id="s-auth-enabled" style="width:auto"> 面板需要登录' +
+      '</label><span class="muted">取消勾选 = 局域网免密直接进面板</span></div>',
+      '<div class="form-grid">',
       '<label>用户名<input id="s-auth-user" placeholder="admin"></label>',
       '<label>新密码<input id="s-auth-pass" type="password" placeholder="留空不修改"></label>',
       '</div><div class="row end" style="margin-top:10px"><button class="btn primary" data-action="save-auth">保存</button></div></div>'
@@ -490,6 +504,8 @@
     set('s-sip-port', sip.port || 5060);
 
     set('s-auth-user', (c.auth && c.auth.username) || 'admin');
+    var enabledBox = $('#s-auth-enabled');
+    if (enabledBox) enabledBox.checked = !!(c.auth && Number(c.auth.enabled));
   }
 
   function val(id) { var el = $('#' + id); return el ? el.value.trim() : ''; }
@@ -579,7 +595,8 @@
         var num = val('ext-number');
         if (!/^\d{2,8}$/.test(num)) { toast('分机号需 2-8 位数字', 'err'); break; }
         api('/api/extensions', { method: 'POST', body: {
-          number: num, display_name: val('ext-name'), password: rawVal('ext-pass'), enabled: 1 } })
+          number: num, display_name: val('ext-name'), password: rawVal('ext-pass'),
+          ring_group: val('ext-ring'), enabled: 1 } })
           .then(function (res) {
             toast('已创建分机 ' + num + '，密码 ' + (res.password || ''), 'ok');
             return loadExtensions();
@@ -598,7 +615,8 @@
         var body = {
           display_name: val('m-ext-name'),
           enabled: Number(val('m-ext-enabled')),
-          forward_to: val('m-ext-forward')
+          forward_to: val('m-ext-forward'),
+          ring_group: val('m-ext-ring')
         };
         var pass2 = rawVal('m-ext-pass');
         if (pass2) body.password = pass2;
@@ -707,11 +725,19 @@
           .then(fillSettings).catch(fail);
         break;
       case 'save-auth':
-        var authBody = { auth: { username: val('s-auth-user') } };
+        var authBody = { auth: {
+          username: val('s-auth-user'),
+          enabled: ($('#s-auth-enabled') && $('#s-auth-enabled').checked) ? 1 : 0
+        } };
         var newPass = rawVal('s-auth-pass');
         if (newPass) authBody.auth.password = newPass;
         api('/api/settings', { method: 'PUT', body: authBody })
-          .then(function () { toast('账号已保存', 'ok'); })
+          .then(function () {
+            toast(authBody.auth.enabled ? '账号已保存，下次打开需要登录' : '已关闭登录，面板免密访问', 'ok');
+            if (!authBody.auth.enabled) setTimeout(function () { location.reload(); }, 800);
+            return loadSettings();
+          })
+          .then(fillSettings)
           .catch(fail);
         break;
 
@@ -780,6 +806,21 @@
 
   window.addEventListener('hashchange', route);
   bindLogin();
+
+  // layout diagnostics: open the panel with ?debug=1 to see the widths in the title
+  if (location.search.indexOf('debug=1') >= 0) {
+    setTimeout(function () {
+      var doc = document.documentElement;
+      var wide = [];
+      $$('#view *').forEach(function (el) {
+        var r = el.getBoundingClientRect();
+        if (r.right > window.innerWidth + 1) {
+          wide.push((el.id || el.className || el.tagName) + ':' + Math.round(r.right));
+        }
+      });
+      document.title = 'vw=' + window.innerWidth + ' sw=' + doc.scrollWidth + ' overflow=' + (wide.slice(0, 4).join(',') || 'none');
+    }, 2500);
+  }
 
   api('/api/status').then(function (data) {
     S.status = data;

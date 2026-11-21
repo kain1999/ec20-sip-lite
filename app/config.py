@@ -47,9 +47,11 @@ DEFAULTS = {
         "init_commands": [
             "ATE0",
             "AT+CMEE=2",
+            "AT+CLIP=1",
+            "AT+CRC=1",
             "AT+CMGF=0",
             "AT+CSCS=\"UCS2\"",
-            "AT+CPMS=\"SM\",\"SM\",\"SM\"",
+            "AT+CPMS=\"ME\",\"ME\",\"ME\"",
             "AT+CNMI=2,1,0,0,0",
         ],
         # commands whose failure is not fatal (firmware dependent)

@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS extensions (
     password TEXT NOT NULL,
     enabled INTEGER DEFAULT 1,
     forward_to TEXT DEFAULT '',
+    ring_group TEXT DEFAULT '',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS registrations (
@@ -113,6 +114,8 @@ DEFAULT_SETTINGS = {
     "auth": {
         "username": "admin",
         "password_hash": "",
+        # 0 = no login required for the web panel (LAN appliance mode)
+        "enabled": 1,
     },
 }
 
@@ -158,8 +161,15 @@ class Db:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         with self._lock:
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
         self._seed()
+
+    def _migrate(self):
+        """Additive migrations for databases created by older versions."""
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(extensions)").fetchall()}
+        if "ring_group" not in existing:
+            self.conn.execute("ALTER TABLE extensions ADD COLUMN ring_group TEXT DEFAULT ''")
 
     # ------------------------------------------------------------ low level
     def execute(self, sql, params=()):
@@ -257,7 +267,8 @@ class Db:
     def get_extension_by_id(self, ext_id):
         return self.query_one("SELECT * FROM extensions WHERE id=?", (ext_id,))
 
-    def create_extension(self, number, display_name="", password=None, enabled=1, forward_to=""):
+    def create_extension(self, number, display_name="", password=None, enabled=1, forward_to="",
+                         ring_group=""):
         number = str(number).strip()
         if not number:
             raise ValueError("number required")
@@ -265,14 +276,15 @@ class Db:
             raise ValueError("分机号已存在: %s" % number)
         password = password or random_password(6)
         self.execute(
-            "INSERT INTO extensions(number, display_name, password, enabled, forward_to, created_at) "
-            "VALUES(?,?,?,?,?,?)",
-            (number, display_name or "", password, 1 if enabled else 0, forward_to or "", ts_str()),
+            "INSERT INTO extensions(number, display_name, password, enabled, forward_to, ring_group, "
+            "created_at) VALUES(?,?,?,?,?,?,?)",
+            (number, display_name or "", password, 1 if enabled else 0, forward_to or "",
+             ring_group or "", ts_str()),
         )
         return self.get_extension(number)
 
     def update_extension(self, ext_id, **fields):
-        allowed = ("display_name", "password", "enabled", "forward_to")
+        allowed = ("display_name", "password", "enabled", "forward_to", "ring_group")
         sets, params = [], []
         for key in allowed:
             if key in fields and fields[key] is not None:
@@ -292,6 +304,41 @@ class Db:
         if row:
             self.execute("DELETE FROM registrations WHERE number=?", (row["number"],))
         self.execute("DELETE FROM extensions WHERE id=?", (ext_id,))
+
+    def ring_group_members(self, number):
+        """Members an extension rings together with (including itself).
+
+        `ring_group` is a comma/&/space separated list, e.g. "1001&1002&1003".
+        Membership is symmetric: if any member lists the others, dialling any of
+        them rings the whole group.
+        """
+        number = str(number).strip()
+        rows = self.list_extensions()
+        by_number = {r["number"]: r for r in rows}
+
+        def parse(value):
+            raw = (value or "").replace("&", ",").replace(";", ",").replace(" ", ",")
+            return [part.strip() for part in raw.split(",") if part.strip()]
+
+        members = []
+        if number in by_number:
+            members = parse(by_number[number].get("ring_group"))
+        if not members:
+            # symmetric discovery: somebody else may have listed us
+            for row in rows:
+                if number in parse(row.get("ring_group")):
+                    members = parse(row.get("ring_group"))
+                    break
+        if not members:
+            return [number]
+        group = []
+        for item in members:
+            if item in by_number and int(by_number[item].get("enabled", 1)):
+                if item not in group:
+                    group.append(item)
+        if number not in group and number in by_number:
+            group.insert(0, number)
+        return group or [number]
 
     # ------------------------------------------------------- registrations
     def upsert_registration(self, number, contact, expires, user_agent="", transport="udp",

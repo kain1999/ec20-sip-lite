@@ -125,6 +125,15 @@ class TestSipMessage(unittest.TestCase):
         self.assertEqual(sipmsg.parse_uri("<sip:1001@192.168.1.5:5060>"), ("1001", "192.168.1.5", 5060))
         self.assertEqual(sipmsg.parse_uri("sip:1001@host"), ("1001", "host", 0))
 
+    def test_parse_uri_display_name_variants(self):
+        # phones disagree about the space between display name and brackets
+        expected = ("1003", "192.168.1.188", 0)
+        self.assertEqual(sipmsg.parse_uri('"1002"<sip:1003@192.168.1.188>'), expected)
+        self.assertEqual(sipmsg.parse_uri('"1002" <sip:1003@192.168.1.188>'), expected)
+        self.assertEqual(sipmsg.parse_uri('1002<sip:1003@192.168.1.188>'), expected)
+        self.assertEqual(sipmsg.parse_uri('<sip:1003@192.168.1.188;transport=udp>;tag=abc'), expected)
+        self.assertEqual(sipmsg.parse_uri('"张三"<sip:1001@h:5060>'), ("1001", "h", 5060))
+
 
 class TestDigest(unittest.TestCase):
     def test_challenge_and_verify(self):

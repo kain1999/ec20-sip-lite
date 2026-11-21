@@ -265,8 +265,13 @@ class Modem:
     def _handle_ring(self):
         if self.call and self.call.state in ("active", "dialing", "alerting"):
             return
-        call = Call("in", self._ring_number or "unknown")
+        number = self._ring_number or ""
+        if not number:
+            # some firmware only delivers +CLIP before RING, or not at all
+            LOG.info("incoming call without caller id (AT+CLIP=1 / network dependent)")
+        call = Call("in", number or "unknown")
         self.call = call
+        self._ring_number = ""
         self._incoming_deadline = time.time() + int(self.config.get("ec20.ring_seconds", 30))
         LOG.info("incoming call from %s", call.number)
         self.on_call("incoming", call)

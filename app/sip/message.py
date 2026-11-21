@@ -51,27 +51,36 @@ def strip_params(value):
 
 
 def parse_uri(value):
-    """Return (user, host, port) from a SIP URI, tolerating angle brackets."""
+    """Return (user, host, port) from a SIP URI, tolerating display names.
+
+    Handles every shape phones actually send:
+        <sip:1001@192.168.1.188>
+        "1002" <sip:1003@192.168.1.188>     (RFC 3261, space after display name)
+        "1002"<sip:1003@192.168.1.188>      (no space - seen from several stacks)
+        sip:1001@host:5060;transport=udp
+    """
     if not value:
         return "", "", 0
-    value = strip_params(value).strip()
-    if value.startswith("<") and value.endswith(">"):
-        value = value[1:-1]
-    if value.lower().startswith("sip:"):
-        value = value[4:]
-    elif value.lower().startswith("sips:"):
-        value = value[5:]
+    text = value.strip()
+    match = re.search(r"<([^>]*)>", text)
+    if match:
+        text = match.group(1).strip()
+    text = strip_params(text)
+    if text.lower().startswith("sips:"):
+        text = text[5:]
+    elif text.lower().startswith("sip:"):
+        text = text[4:]
     user = ""
-    if "@" in value:
-        user, value = value.split("@", 1)
-    host, port = value, 0
-    if ":" in value:
-        host, port_s = value.rsplit(":", 1)
+    if "@" in text:
+        user, text = text.split("@", 1)
+    host, port = text, 0
+    if ":" in host:
+        host, port_s = host.rsplit(":", 1)
         try:
             port = int(port_s)
         except ValueError:
             port = 0
-    return user, host, port
+    return user.strip(), host.strip(), port
 
 
 class SipMessage:

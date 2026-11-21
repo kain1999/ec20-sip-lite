@@ -135,7 +135,9 @@ class AppContext:
             "webhook": dict(settings.get("webhook", {})),
             "dial": dict(settings.get("dial", {})),
             "sip": dict(settings.get("sip", {})),
-            "auth": {"username": auth.get("username", "admin")},
+            "auth": {"username": auth.get("username", "admin"),
+                     "enabled": int(auth.get("enabled", 1)),
+                     "password_set": bool(auth.get("password_hash"))},
         }
 
 
@@ -188,7 +190,16 @@ class Handler(BaseHTTPRequestHandler):
                     return value.strip()
         return ""
 
+    def _auth_required(self):
+        """Login can be switched off from the panel (LAN appliance mode)."""
+        if self.ctx.config.get("web.auth_disabled"):
+            return False
+        auth = self.ctx.db.get_setting("auth", {}) or {}
+        return bool(int(auth.get("enabled", 1)))
+
     def _authed(self):
+        if not self._auth_required():
+            return True
         return self.ctx.session_valid(self._cookie("sid"))
 
     # ------------------------------------------------------------ dispatch
@@ -218,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/login" and method == "POST":
                 self._login()
                 return
-            if not self._authed():
+            if self._auth_required() and not self._authed():
                 self._json({"ok": False, "error": "unauthorized"}, 401)
                 return
             self._api(method, path, query)
@@ -296,6 +307,47 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"lines": ring_tail(min(600, max(10, tail)))})
             return
 
+        if path == "/api/diag/sip" and method == "GET":
+            user = (query.get("user", [""])[0] or "").strip()
+            info = {"server": ctx.sip.status() if ctx.sip else {},
+                    "extensions": [{"number": e["number"], "enabled": e["enabled"]}
+                                   for e in db.list_extensions()],
+                    "registrations": [{"number": r["number"], "contact": r["contact"],
+                                       "updated_at": r["updated_at"]}
+                                      for r in db.registrations()],
+                    "hints": [
+                        "话机填写：服务器=%s，端口=%s，传输=UDP" % (
+                            ctx.config.get("sip.external_ip") or "盒子IP",
+                            ctx.config.get("sip.port", 5060)),
+                        "认证用户名、账号、认证ID 三处都填分机号（例如 1003），不要填中文",
+                        "SIP 域可填 ec20sip.local 或盒子 IP；两者都能注册",
+                        "403=分机不存在或被停用；401 反复=密码不匹配",
+                    ]}
+            if user:
+                ext = db.get_extension(user)
+                info["user"] = {
+                    "number": user,
+                    "exists": bool(ext),
+                    "enabled": bool(ext and int(ext.get("enabled", 1))),
+                    "registered": bool(ctx.sip and ctx.sip.registrar.contact(user)),
+                    "password_set": bool(ext and ext.get("password")),
+                }
+                if not ext:
+                    near = [e["number"] for e in db.list_extensions()
+                            if e["number"].startswith(user[:2])][:5]
+                    info["user"]["similar"] = near
+            self._json(info)
+            return
+
+        if path == "/api/auth/mode" and method == "GET":
+            auth = db.get_setting("auth", {}) or {}
+            self._json({
+                "login_required": self._auth_required(),
+                "username": auth.get("username", "admin"),
+                "password_set": bool(auth.get("password_hash")),
+            })
+            return
+
         if path == "/api/extensions" and method == "GET":
             items = []
             for row in db.list_extensions():
@@ -305,6 +357,8 @@ class Handler(BaseHTTPRequestHandler):
                     "display_name": row.get("display_name", ""),
                     "password": row["password"], "enabled": row["enabled"],
                     "forward_to": row.get("forward_to", ""),
+                    "ring_group": row.get("ring_group", ""),
+                    "ring_members": db.ring_group_members(row["number"]),
                     "registered": bool(reg),
                     "contact": reg.get("contact", "") if reg else "",
                     "last_seen": reg.get("updated_at", "") if reg else "",
@@ -322,8 +376,10 @@ class Handler(BaseHTTPRequestHandler):
             password = str(payload.get("password") or "").strip() or random_password(8)
             display = str(payload.get("display_name", "")).strip()
             enabled = 1 if payload.get("enabled", 1) else 0
+            ring_group = str(payload.get("ring_group", "") or "").strip()
             try:
-                row = db.create_extension(number, display, password, enabled)
+                row = db.create_extension(number, display, password, enabled,
+                                          ring_group=ring_group)
             except ValueError as exc:
                 self._error(str(exc), 409)
                 return
@@ -345,13 +401,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(rest) == 1 and method == "PUT":
                 payload = self._body()
                 fields = {}
-                for key in ("display_name", "password", "enabled", "forward_to"):
+                for key in ("display_name", "password", "enabled", "forward_to", "ring_group"):
                     if key in payload:
                         value = payload[key]
                         if key == "password":
                             value = str(value or "").strip() or None
                         elif key == "enabled":
                             value = 1 if truthy(value) else 0
+                        elif key == "ring_group":
+                            value = str(value or "").strip()
                         fields[key] = value
                 db.update_extension(ext_id, **fields)
                 if "enabled" in fields and not fields["enabled"]:
@@ -504,6 +562,13 @@ class Handler(BaseHTTPRequestHandler):
                 new_password = str(auth_patch.get("password") or "").strip()
                 if new_password:
                     auth["password_hash"] = hash_password(new_password)
+                if "enabled" in auth_patch:
+                    enabled = 1 if truthy(auth_patch["enabled"]) else 0
+                    if enabled and not auth.get("password_hash"):
+                        self._error("开启登录前请先设置密码", 400)
+                        return
+                    auth["enabled"] = enabled
+                    LOG.info("web panel login %s", "enabled" if enabled else "disabled")
                 patch["auth"] = auth
             db.merge_settings(patch)
             if "sip" in patch:
@@ -574,7 +639,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             payload = self._body()
             number = norm_number(payload.get("number", "13800138000")) or "13800138000"
-            call_id = ctx.modem.simulate_incoming(number)
+
+            async def _ring():
+                # must run on the event loop: modem callbacks use loop.create_task
+                return ctx.modem.simulate_incoming(number)
+            call_id = ctx.call(_ring(), timeout=10)
             self._json({"ok": True, "call_id": call_id})
             return
 
@@ -585,7 +654,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._body()
             peer = str(payload.get("peer", "13800138000"))
             text = str(payload.get("text", "模拟短信：验证码 123456"))
-            record = ctx.modem.simulate_sms(peer, text)
+
+            async def _sms():
+                return ctx.modem.simulate_sms(peer, text)
+            record = ctx.call(_sms(), timeout=10)
             self._json({"ok": True, "sms": record})
             return
 

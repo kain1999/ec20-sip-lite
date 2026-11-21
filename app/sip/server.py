@@ -78,12 +78,18 @@ class Registrar:
         server = self.server
         to_user = sipmsg.parse_uri(message.get("To") or "")[0]
         from_user = sipmsg.parse_uri(message.get("From") or "")[0]
-        number = to_user or from_user
+        number = to_user or from_user or sipmsg.parse_uri(message.uri or "")[0]
         if not number:
             server.send_message(sipmsg.build_response(message, 400, "Bad Request"), addr)
             return
         extension = self.db.get_extension(number)
-        if not extension or not int(extension.get("enabled", 1)):
+        if not extension:
+            LOG.warning("REGISTER rejected 403: unknown extension %r (raw To=%r From=%r from %s)",
+                        number, message.get("To"), message.get("From"), addr[0])
+            server.send_message(sipmsg.build_response(message, 403, "Forbidden"), addr)
+            return
+        if not int(extension.get("enabled", 1)):
+            LOG.warning("REGISTER rejected 403: extension %s is disabled", number)
             server.send_message(sipmsg.build_response(message, 403, "Forbidden"), addr)
             return
         if not message.get("Authorization"):
@@ -171,26 +177,48 @@ class SipCall:
 
     # --------------------------------------------------------------- events
     def on_leg_ringing(self, leg):
+        if self.ring_legs:
+            # ring group: everyone rings until one answers, do not cancel on 180
+            return
         if leg is self.leg_b and self.leg_a:
             self.leg_a.ringing()
-        if leg in self.ring_legs:
-            for other in self.ring_legs:
-                if other is not leg and other.state == "inviting":
-                    other.cancel()
 
     def on_leg_answered(self, leg):
         if self.ended:
             leg.send_bye()
             return
-        if leg in self.ring_legs and self.leg_a is not leg:
-            # an extension picked up a modem call
-            self.leg_a = leg
-            self.answered_at = time.time()
+        if leg in self.ring_legs:
+            if leg is self.leg_b or leg is self.leg_a:
+                return                       # already the active party
+            if self.answered_at is not None:
+                # somebody else already picked this group call up: this phone
+                # must be released, without touching the active call
+                LOG.info("ring group: already answered, releasing %s", leg.user)
+                leg.send_bye()
+                return
+            # first answer wins: stop the remaining members
             for other in self.ring_legs:
-                if other is not leg:
-                    other.cancel()
-            self._answered.set()
-            self.manager.server.loop.create_task(self._connect_modem())
+                if other is not leg and other.state in ("inviting", "ringing-remote"):
+                    try:
+                        other.cancel()
+                    except Exception:  # pragma: no cover
+                        LOG.debug("cancel failed", exc_info=True)
+            if self.leg_a is None:
+                # inbound EC20 call answered by an extension
+                self.leg_a = leg
+                self.answered_at = time.time()
+                self.set_target("%s(分机%s)" % (self.from_user, leg.user))
+                self._answered.set()
+                self.manager.server.loop.create_task(self._connect_modem())
+                return
+            # extension -> ring group: bridge the caller to the answered member
+            if self.leg_a.answer():
+                self.leg_b = leg
+                self.answered_at = time.time()
+                self.set_target(leg.user)
+                self._start_bridge()
+            else:
+                self.end("channel unavailable")
             return
         if leg is self.leg_b and self.leg_a:
             if self.leg_a.answer():
@@ -201,17 +229,31 @@ class SipCall:
 
     def on_leg_failed(self, leg, status, reason):
         LOG.info("leg failed %s: %s %s", leg.display, status, reason)
+        if leg in self.ring_legs:
+            # one member rejected/busy: keep ringing the rest, only give up when
+            # nobody is left (caller stays on the line meanwhile)
+            alive = [other for other in self.ring_legs
+                     if other is not leg and other.state not in ("failed", "terminated", "cancelled")]
+            if not alive:
+                LOG.info("ring group exhausted for call %s", self.id)
+                if self.leg_a is not None and self.leg_a.state in ("invited", "ringing"):
+                    self.leg_a.reject(486, "Busy Here")
+                self.end("no answer")
+            return
         if leg is self.leg_b and self.leg_a:
             code = 486 if status in (486, 480) else 503
             self.leg_a.reject(code, "Destination Unavailable")
             self.end("failed")
-        elif leg in self.ring_legs and self.leg_a is leg:
+        elif self.leg_a is leg:
             self.end("failed")
 
     def on_leg_bye(self, leg):
         if leg is self.leg_a:
             if self.leg_b:
                 self.leg_b.send_bye()
+            for other in self.ring_legs:
+                if other.state in ("inviting", "ringing-remote"):
+                    other.cancel()
             if self.manager.is_modem_call(self):
                 self.manager.server.loop.create_task(self.manager.modem_hangup())
         else:
@@ -232,6 +274,8 @@ class SipCall:
 
     # --------------------------------------------------------------- bridge
     def _start_bridge(self):
+        if self.bridge is not None:
+            return
         loop = self.manager.server.loop
         if self.leg_b is not None:
             self.bridge = media.Bridge(loop, self.leg_a.media, self.leg_b.media).start()
@@ -280,6 +324,16 @@ class CallManager:
         self.calls = {}
 
     # -------------------------------------------------------------- helpers
+    def display_for(self, number):
+        """Canonical caller display: the extension number itself.
+
+        Phones often carry a stale "Display Name" (e.g. every account labelled
+        1002), which leaks into From and confuses everyone. We always present
+        the extension number so 1001 shows as 1001 for the other party.
+        """
+        number = (number or "").strip()
+        return number or "unknown"
+
     def _registered_contact(self, number):
         contact = self.server.registrar.contact(number)
         if not contact:
@@ -331,10 +385,13 @@ class CallManager:
         self.server.legs[leg.call_id] = leg
         prefix = str(self.server.config.get("ec20.voice_prefix", "9") or "")
         extension = self.server.db.get_extension(target)
-        contact = self._registered_contact(target) if extension else None
-        if extension and contact:
-            await self._call_extension(call, target, contact, addr)
-            return
+        if extension:
+            group = self.server.db.ring_group_members(target)
+            live = [n for n in group if n == target and self._registered_contact(n)
+                    or n != target and self._registered_contact(n)]
+            if live:
+                await self._call_group(call, live)
+                return
         number = target
         if prefix and number.startswith(prefix):
             number = number[len(prefix):]
@@ -345,13 +402,34 @@ class CallManager:
             return
         await self._call_modem(call, number)
 
+    async def _call_group(self, call, numbers):
+        """Ring several extensions at once; the first answer wins, rest cancel."""
+        call.to_user = "&".join(numbers)
+        call.ring_legs = []
+        for number in numbers:
+            contact = self._registered_contact(number)
+            if not contact:
+                continue
+            host, port = contact
+            leg = SipLeg(self.server, call, "uac", user=number)
+            await leg.invite(number, host, port, from_user=call.from_user,
+                             display=self.display_for(call.from_user))
+            self.server.legs[leg.call_id] = leg
+            call.ring_legs.append(leg)
+        if not call.ring_legs:
+            call.leg_a.reject(480, "Temporarily Unavailable")
+            call.end("no registered member")
+            return
+        call.leg_a.ringing()
+        LOG.info("ring group %s -> %s", call.from_user, ",".join(numbers))
+
     async def _call_extension(self, call, target, contact, addr):
         host, port = contact
         leg_b = SipLeg(self.server, call, "uac", user=target)
         call.leg_b = leg_b
         call.set_target(target)
         ok = await leg_b.invite(target, host, port, from_user=call.from_user,
-                                display=call.from_user)
+                                display=self.display_for(call.from_user))
         # register only after invite(): invite() assigns the Call-ID
         self.server.legs[leg_b.call_id] = leg_b
         if not ok:
@@ -410,13 +488,18 @@ class CallManager:
 
     async def _ring_extensions(self, modem_call):
         ring_seconds = int(self.server.config.get("ec20.ring_seconds", 30))
-        call = SipCall(self, "in", "modem", modem_call.number)
+        caller = norm_number(modem_call.number) or "unknown"
+        call = SipCall(self, "in", caller, "群振")
         call.modem_id = modem_call.id
-        call.to_user = modem_call.number
+        call.to_user = caller
         self.calls[call.id] = call
         dial = self.server.db.get_setting("dial", {}) or {}
         target = (dial.get("forward_all_to") or "").strip()
-        numbers = [target] if target else list(self.server.registrar.registered().keys())
+        if target:
+            numbers = self.server.db.ring_group_members(target)
+            call.to_user = "&".join(numbers)
+        else:
+            numbers = list(self.server.registrar.registered().keys())
         if not numbers:
             LOG.info("incoming call with no registered extension, rejecting")
             await self.server.modem.hangup()
@@ -429,7 +512,10 @@ class CallManager:
                 continue
             host, port = contact
             leg = SipLeg(self.server, call, "uac", user=number)
-            await leg.invite(number, host, port, from_user="modem", display="EC20 来电")
+            # From carries the real caller, so the phone's screen shows the
+            # mobile number instead of an internal label.
+            await leg.invite(number, host, port, from_user=caller,
+                             display=self.display_for(caller))
             self.server.legs[leg.call_id] = leg
             call.ring_legs.append(leg)
             legs.append(leg)

@@ -163,10 +163,16 @@ class SipLeg:
         body = sdp.build_sdp(self.server.media_ip, self.media.port, seed=self.call_id)
         contact = "<sip:%s@%s:%d>" % (from_user, self.server.media_ip, self.server.port)
         uri = "sip:%s@%s:%d" % (target_user, host, int(port or 5060))
+        # the caller's identity is the bare extension number: no stale display
+        # name from the phone can leak into the other party's screen
+        from_header = ("<sip:%s@%s>;tag=%s" % (from_user, self.server.media_ip, self.local_tag)
+                       if not display or display == from_user
+                       else "\"%s\" <sip:%s@%s>;tag=%s" % (display, from_user,
+                                                           self.server.media_ip, self.local_tag))
         request = sipmsg.build_request("INVITE", uri, headers=[
             ("Via", "SIP/2.0/UDP %s:%d;branch=%s;rport" % (self.server.media_ip, self.server.port, branch())),
             ("Max-Forwards", "70"),
-            ("From", "\"%s\" <sip:%s@%s>;tag=%s" % (display, from_user, self.server.media_ip, self.local_tag)),
+            ("From", from_header),
             ("To", "<sip:%s@%s>" % (target_user, host)),
             ("Call-ID", self.call_id),
             ("CSeq", "%d INVITE" % self.local_cseq),
@@ -249,10 +255,15 @@ class SipLeg:
             LOG.exception("bye handler failed")
 
     def send_bye(self):
-        if self.state not in ("answered", "ringing-remote", "inviting"):
+        if self.state not in ("answered", "ringing-remote", "inviting", "ringing"):
             return
         if self.state in ("inviting", "ringing-remote"):
             self.cancel()
+            return
+        if self.role == "uas":
+            # we are the UAS: reply-side teardown is driven by the peer's BYE
+            return
+        if self.pending_request is None:
             return
         self.local_cseq += 1
         bye = sipmsg.build_request("BYE", self.pending_request.uri if self.pending_request else
