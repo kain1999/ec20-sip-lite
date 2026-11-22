@@ -7,7 +7,8 @@
     "external_ip": "",
     "rtp_ports": [],
     "register_expiry": 3600,
-    "max_extensions": 64
+    "max_extensions": 64,
+    "video": true
   },
   "ec20": {
     "at_port": "/dev/ec20-at",

@@ -174,6 +174,8 @@ class SipCall:
         self.modem_id = None
         self.modem_port = None
         self.bridge = None
+        self.wants_video = False
+        self.video_offer = None
         self.audio = None
         self.cdr_id = manager.server.db.add_cdr(ts_str(), from_user, to_user, direction)
         self._answered = asyncio.Event()
@@ -231,13 +233,16 @@ class SipCall:
                 self._answered.set()
                 self.manager.server.loop.create_task(self._connect_modem())
                 return
-            # extension -> ring group: bridge the caller to the answered member
+            # extension -> ring group: bridge the caller to the answered member.
+            # leg_b must be set *before* answer(): the caller's SDP depends on
+            # whether the answered callee negotiated video.
+            self.leg_b = leg
             if self.leg_a.answer():
-                self.leg_b = leg
                 self.answered_at = time.time()
                 self.set_target(leg.user)
                 self._start_bridge()
             else:
+                self.leg_b = None
                 self.end("channel unavailable")
             return
         if leg is self.leg_b and self.leg_a:
@@ -308,6 +313,14 @@ class SipCall:
         loop = self.manager.server.loop
         if self.leg_b is not None:
             self.bridge = media.Bridge(loop, self.leg_a.media, self.leg_b.media).start()
+            a_video, b_video = self.leg_a.video, self.leg_b.video
+            if a_video and b_video:
+                if self.leg_a.video_remote:
+                    b_video.set_peer(*self.leg_a.video_remote)
+                if self.leg_b.video_remote:
+                    a_video.set_peer(*self.leg_b.video_remote)
+                LOG.info("video relay up for call %s (%s <-> %s)", self.id,
+                         a_video.port, b_video.port)
         elif self.modem_port is not None:
             self.bridge = media.Bridge(loop, self.leg_a.media, self.modem_port).start()
         LOG.info("bridge up for call %s (%s -> %s)", self.id, self.from_user, self.to_user)
@@ -423,6 +436,12 @@ class CallManager:
     async def _setup_invite(self, call, leg, message, peer, target):
         await leg.accept(message, peer)
         self.server.legs[leg.call_id] = leg
+        if leg.video_offer and self.server.config.get("sip.video", True):
+            call.wants_video = True
+            call.video_offer = leg.video_offer
+            leg.video = media.RawRelayPort(self.server.loop,
+                                           allocator=self.server.rtp_allocator)
+            await leg.video.open()
         prefix = str(self.server.config.get("ec20.voice_prefix", "9") or "")
         extension = self.server.db.get_extension(target)
         if extension:
@@ -461,6 +480,13 @@ class CallManager:
                 continue
             host, port = contact
             leg = SipLeg(self.server, call, "uac", user=number)
+            if call.wants_video:
+                # the caller asked for video: offer it towards this callee too and
+                # relay the packets between the two sides without decoding them
+                leg.video_offer = call.video_offer
+                leg.video = media.RawRelayPort(self.server.loop,
+                                               allocator=self.server.rtp_allocator)
+                await leg.video.open()
             await leg.invite(number, host, port, from_user=call.from_user,
                              display=self.display_for(call.from_user))
             self.server.legs[leg.call_id] = leg

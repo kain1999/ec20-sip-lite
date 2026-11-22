@@ -34,6 +34,9 @@ if [ "$UPGRADE" = "0" ]; then
 fi
 cp -r "$SRC_DIR/app" "$APP_DIR/"
 cp -r "$SRC_DIR/tools" "$APP_DIR/" 2>/dev/null || true
+# tests are shipped so the box can self-check after an upgrade:
+#   cd /opt/ec20-sip-lite && python3 -m unittest discover -s tests
+cp -r "$SRC_DIR/tests" "$APP_DIR/" 2>/dev/null || true
 cp -r "$SRC_DIR/scripts" "$APP_DIR/" 2>/dev/null || true
 cp -r "$SRC_DIR/packaging" "$APP_DIR/" 2>/dev/null || true
 cp "$SRC_DIR/README.md" "$APP_DIR/" 2>/dev/null || true

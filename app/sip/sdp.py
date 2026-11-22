@@ -9,8 +9,14 @@ def _session_id(seed):
 
 
 def build_sdp(ip, port, seed=None, payload_types=(0, 8), direction="sendrecv",
-              telephone_event=True, session_name="ec20sip"):
-    """Return an SDP body offering PCMU/PCMA (+ telephone-event 101)."""
+              telephone_event=True, session_name="ec20sip",
+              video_port=None, video_payloads=(96,), video_codec="H264"):
+    """Return an SDP body offering PCMU/PCMA (+ telephone-event 101).
+
+    When video_port is given a second media section is added. The gateway never
+    transcodes video - it relays the RTP packets untouched - so the codec name
+    only has to be truthful for the peer's negotiation.
+    """
     seed = seed or "%s:%s" % (ip, port)
     sid = _session_id(seed)
     pts = [str(pt) for pt in payload_types]
@@ -36,6 +42,12 @@ def build_sdp(ip, port, seed=None, payload_types=(0, 8), direction="sendrecv",
     lines.extend(rtpmaps)
     lines.append("a=ptime:20")
     lines.append("a=%s" % direction)
+    if video_port:
+        vpts = " ".join(str(pt) for pt in video_payloads)
+        lines.append("m=video %d RTP/AVP %s" % (int(video_port), vpts))
+        for pt in video_payloads:
+            lines.append("a=rtpmap:%d %s/90000" % (int(pt), video_codec))
+        lines.append("a=%s" % ("sendrecv" if direction == "sendrecv" else direction))
     return ("\r\n".join(lines) + "\r\n").encode("latin-1")
 
 
@@ -52,6 +64,8 @@ def parse_sdp(body):
     pts = []
     codec = None
     direction = "sendrecv"
+    video = None
+    media_kind = ""
     for raw in text.replace("\r\n", "\n").split("\n"):
         line = raw.strip()
         if not line:
@@ -64,6 +78,7 @@ def parse_sdp(body):
             if not ip:
                 ip = line[9:].strip()
         elif line.startswith("m=audio "):
+            media_kind = "audio"
             parts = line.split()
             if len(parts) >= 4:
                 try:
@@ -71,6 +86,24 @@ def parse_sdp(body):
                 except ValueError:
                     port = 0
                 pts = [p for p in parts[3:] if p.isdigit()]
+        elif line.startswith("m=video "):
+            media_kind = "video"
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    vport = int(parts[1])
+                except ValueError:
+                    vport = 0
+                if vport:
+                    video = {"port": vport, "payload_types": [p for p in parts[3:] if p.isdigit()],
+                             "codec": None}
+        elif line.startswith("a=rtpmap:") and media_kind == "video" and video is not None:
+            try:
+                pt, name = line[len("a=rtpmap:"):].split(None, 1)
+                if video.get("payload_types") and pt in video["payload_types"]:
+                    video["codec"] = name.split("/")[0].upper()
+            except ValueError:
+                pass
         elif line.startswith("a=sendrecv"):
             direction = "sendrecv"
         elif line.startswith("a=sendonly"):
@@ -89,13 +122,11 @@ def parse_sdp(body):
         if pt == "8":
             chosen = "PCMA"
             break
-    if chosen is None:
-        for pt in pts:
-            pass
     return {
         "ip": ip,
         "port": port,
         "payload_types": pts,
         "codec": chosen,
         "direction": direction,
+        "video": video,
     }

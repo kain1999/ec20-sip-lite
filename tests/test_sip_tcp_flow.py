@@ -499,6 +499,74 @@ class SipTcpFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(callee_invite.get("CSeq").split()[0],
                          cancel.get("CSeq").split()[0])
 
+    async def test_video_is_negotiated_and_relayed(self):
+        """A video INVITE must be answered with video and its RTP relayed."""
+        await self.register(self.c1, "1001", "pass1")
+        await self.register(self.c2, "1002", "pass2")
+        loop = asyncio.get_event_loop()
+
+        class Sink(asyncio.DatagramProtocol):
+            def __init__(self):
+                self.queue = asyncio.Queue()
+                self.port = 0
+
+            def connection_made(self, transport):
+                self.transport = transport
+                self.port = transport.get_extra_info("sockname")[1]
+
+            def datagram_received(self, data, addr):
+                self.queue.put_nowait(data)
+
+        t1, c1v = await loop.create_datagram_endpoint(Sink, local_addr=(IP, 0))
+        t2, c2v = await loop.create_datagram_endpoint(Sink, local_addr=(IP, 0))
+        try:
+            call_id = "vid-%s" % secrets.token_hex(4)
+            self.c1.send(sipmsg.build_request(
+                "INVITE", "sip:1002@%s:%d" % (IP, self.port), headers=[
+                    ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (IP, self.port, branch())),
+                    ("From", "<sip:1001@%s>;tag=%s" % (IP, secrets.token_hex(3))),
+                    ("To", "<sip:1002@%s>" % IP),
+                    ("Call-ID", call_id), ("CSeq", "1 INVITE"),
+                    ("Contact", "<sip:1001@%s:%d>" % (IP, self.c1.port)),
+                    ("Content-Type", "application/sdp"),
+                ], body=sdp.build_sdp(IP, 41000, video_port=c1v.port)))
+            await self.c1.recv()                    # 100
+            invite = await self.c2.recv()           # INVITE towards 1002
+            offered = sdp.parse_sdp(invite.body)
+            self.assertIsNotNone(offered, "INVITE must carry SDP")
+            self.assertIsNotNone(offered.get("video"), "server must offer video to the callee")
+            self.assertNotEqual(offered["video"]["port"], 0)
+
+            self.c2.send(sipmsg.build_response(invite, 200, "OK", headers=[
+                ("Contact", "<sip:1002@%s:%d>" % (IP, self.c2.port)),
+                ("Content-Type", "application/sdp")],
+                body=sdp.build_sdp(IP, 42000, video_port=c2v.port),
+                to_tag=secrets.token_hex(3)))
+
+            final = None
+            for _ in range(6):
+                message = await self.c1.recv()
+                if message.status == 200:
+                    final = message
+                    break
+            self.assertIsNotNone(final, "caller never got 200 OK")
+            answered = sdp.parse_sdp(final.body)
+            self.assertIsNotNone(answered.get("video"), "200 OK must answer with video")
+            server_video_port = answered["video"]["port"]
+            self.c1.send(self.build("ACK", "1001", call_id, 2, to_user="1002",
+                                    extra=[("To", final.get("To"))]))
+            await self.c2.recv()
+            await asyncio.sleep(0.2)
+
+            # a video packet towards us must be relayed to the callee untouched
+            payload = b"\x80\x60\x00\x01" + b"VIDEOFRAME" * 4
+            c1v.transport.sendto(payload, (IP, server_video_port))
+            received = await asyncio.wait_for(c2v.queue.get(), 3)
+            self.assertEqual(received, payload, "video RTP must pass through unchanged")
+        finally:
+            t1.close()
+            t2.close()
+
     async def test_extension_to_extension_call(self):
         await self.register(self.c1, "1001", "pass1")
         await self.register(self.c2, "1002", "pass2")

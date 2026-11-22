@@ -44,6 +44,9 @@ class SipLeg:
         # address used in Via/Contact/SDP: LAN ip for LAN peers, public ip for
         # remote peers (frp). Filled in by accept()/invite().
         self.advert_ip = server.media_ip if server else ""
+        self.video = None                # media.RawRelayPort when video is agreed
+        self.video_remote = None         # (ip, port) of the peer's video stream
+        self.video_offer = None          # SDP m=video dict from the INVITE
         self._retransmit_task = None
         self._answered_200 = None
         self.last_error = ""
@@ -73,6 +76,9 @@ class SipLeg:
         self.remote_target = peer
         self.advert_ip = self.server.media_ip_for(peer.ip)
         self.remote_sdp = sdp.parse_sdp(request.body)
+        if self.remote_sdp and self.remote_sdp.get("video"):
+            self.video_offer = self.remote_sdp["video"]
+            self.video_remote = (self.remote_sdp["ip"], self.video_offer["port"])
         self.state = "invited"
         await self.media.open()
         self.server.send_message(sipmsg.build_response(request, 100, "Trying",
@@ -95,7 +101,14 @@ class SipLeg:
     def answer(self):
         if self.state not in ("invited", "ringing"):
             return False
-        body = sdp.build_sdp(self.advert_ip, self.media.port, seed=self.call_id)
+        video_port = None
+        if self.video is not None:
+            other = self.call.leg_b if self.role == "uas" else None
+            if self.role != "uas" or (other is not None and other.video is not None):
+                video_port = self.video.port
+        body = sdp.build_sdp(self.advert_ip, self.media.port, seed=self.call_id,
+                             video_port=video_port,
+                             video_codec=(self.video_offer or {}).get("codec") or "H264")
         headers = [
             ("Contact", "<sip:box@%s:%d>" % (self.advert_ip, self.server.port)),
             ("Content-Type", "application/sdp"),
@@ -167,7 +180,9 @@ class SipLeg:
         self.state = "inviting"
         self.remote_target = await self.server.outbound_peer(target_user, host, int(port or 5060))
         await self.media.open()
-        body = sdp.build_sdp(self.advert_ip, self.media.port, seed=self.call_id)
+        body = sdp.build_sdp(self.advert_ip, self.media.port, seed=self.call_id,
+                             video_port=(self.video.port if self.video else None),
+                             video_codec=(self.video_offer or {}).get("codec") or "H264")
         contact = "<sip:%s@%s:%d;transport=tcp>" % (from_user, self.advert_ip, self.server.port)
         uri = "sip:%s@%s:%d" % (target_user, host, int(port or 5060))
         # the caller's identity is the bare extension number: no stale display
@@ -233,6 +248,8 @@ class SipLeg:
             self.remote_tag = sipmsg.tag_of(message.get("To")) or self.remote_tag
             self.state = "answered"
             self.remote_sdp = sdp.parse_sdp(message.body)
+            if self.remote_sdp and self.remote_sdp.get("video"):
+                self.video_remote = (self.remote_sdp["ip"], self.remote_sdp["video"]["port"])
             if self.remote_sdp:
                 codec = self.remote_sdp.get("codec") or "PCMU"
                 self.codec = codec
@@ -375,6 +392,9 @@ class SipLeg:
         self.state = "cancelled"
 
     def close(self):
+        if self.video is not None:
+            self.video.close()
+            self.video = None
         if self._retransmit_task:
             self._retransmit_task.cancel()
             self._retransmit_task = None

@@ -107,6 +107,18 @@ class PortAllocator:
                 "remote": self.rtp.remote, "port": self.port, "codec": self.codec}
 
 
+class _RawRelayProtocol(asyncio.DatagramProtocol):
+    def __init__(self, owner):
+        self.owner = owner
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        self.owner._on_datagram(data, addr)
+
+
 class ModemPort:
     """Bridges the EC20 USB-audio session into the media plane."""
 
@@ -185,3 +197,65 @@ class Bridge:
             except (asyncio.CancelledError, Exception):
                 pass
             self._task = None
+
+
+class RawRelayPort:
+    """Video (or any non-G.711) RTP relay:转发原始包，不解析、不转码。
+
+    Zero CPU per packet: the datagram is forwarded with its original RTP header,
+    so H.264/VP8/whatever the phones negotiated passes through untouched. This
+    is the only sane way to support video in a 14 MB Python process.
+    """
+
+    def __init__(self, loop, bind_ip="0.0.0.0", allocator=None):
+        self.loop = loop
+        self.bind_ip = bind_ip
+        self.allocator = allocator
+        self.transport = None
+        self.port = 0
+        self.peer = None
+        self.packets_in = 0
+        self.packets_out = 0
+        self._protocol = None
+        self._reserved = None
+
+    async def open(self):
+        self._reserved = self.allocator.reserve() if self.allocator else None
+        try:
+            self.transport, self._protocol = await self.loop.create_datagram_endpoint(
+                lambda: _RawRelayProtocol(self),
+                local_addr=(self.bind_ip, int(self._reserved or 0)))
+        except OSError as exc:
+            LOG.warning("video rtp port %s unavailable (%s)", self._reserved, exc)
+            self._reserved = None
+            self.transport, self._protocol = await self.loop.create_datagram_endpoint(
+                lambda: _RawRelayProtocol(self), local_addr=(self.bind_ip, 0))
+        self.port = self.transport.get_extra_info("sockname")[1]
+        return self.port
+
+    def set_peer(self, ip, port):
+        if ip and port:
+            self.peer = (ip, int(port))
+
+    def _on_datagram(self, data, addr):
+        self.packets_in += 1
+        if self.peer is None:
+            # symmetric RTP: learn from the first packet
+            self.peer = addr
+        if self.transport is None:
+            return
+        try:
+            self.transport.sendto(data, self.peer)
+            self.packets_out += 1
+        except OSError:
+            pass
+
+    def close(self):
+        if self.transport:
+            try:
+                self.transport.close()
+            except Exception:
+                pass
+            self.transport = None
+        if self.allocator and self.port:
+            self.allocator.release(self.port)

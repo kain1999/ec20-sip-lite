@@ -37,6 +37,7 @@ sudo sh install.sh            # 装到 /opt/ec20-sip-lite，注册 systemd 服�
 | SIP 服务器 | **TCP 注册器 + B2BUA**（默认，可开 UDP）；摘要认证（MD5）、对称 RTP、分机互打、拨外线、外线来电群振、振铃组 |
 | 分机管理 | Web 增删改查、随机密码、在线状态、踢下线、呼叫转移字段 |
 | EC20 驱动 | 纯 stdlib 的 termios AT 通道、URC 解析、`ATD/ATA/ATH/VTS`、`CMGR/CMGS` PDU 收发、`QPCMV` UAC 开关 |
+| 视频（分机之间） | SIP `m=video` 协商 + **RTP 透传**（H.264/VP8 原样转发，不转码、几乎零 CPU）；EC20 无视频通路，涉及外线的通话自动降级为纯音频 |
 | 语音 | G.711 PCMU/PCMA 纯 Python 编解码，`arecord/aplay` 抓放 USB 音频，RFC2833 DTMF 双向 |
 | 短信 | PDU 编解码（UCS2 中文 / GSM7 / 长短信拼接）、收发存 SQLite、SIP MESSAGE 互转 |
 | 转发 | 关键词/号码/全部 → 邮件(SMTP) / 钉钉机器人(加签) / 通用 Webhook，带规则与发送日志 |
@@ -154,6 +155,7 @@ curl -X POST -H 'Content-Type: application/json' -d '{"peer":"10001","text":"验
 | USB 串口 | 内核无 `option.ko`，`usbserial_generic` 手工绑定后出现 `/dev/ttyUSB0..5`；AT 口 = 接口 2 |
 | `AT+QCFG="usbcfg"` | 出厂 `...,1,1,1,1,1,0,0`（uac=0）→ 改成 uac=1 后出现声卡 `card 2 [EC20CEHCLG]` |
 | 声卡 | `pcmC2D0c/p` 8kHz 单声道可用，`QAUDMOD=3` 生效 |
+| 视频（分机之间） | SIP `m=video` 协商 + **RTP 透传**（H.264/VP8 原样转发，不转码、几乎零 CPU）；EC20 无视频通路，涉及外线的通话自动降级为纯音频 |
 | 语音 | 纯流量卡无法拨号（`ATD` 返回 OK 但网络侧不建立呼叫），换语音/Volte 卡后走同一代码路径 |
 | 短信发送 | 该卡被网络拒绝（`+CMS ERROR`），代码路径已验证到 `AT+CMGS` 提示符与 PDU 提交 |
 | SIP | 注册（401→200）、OPTIONS、分机互打（100/180/200/ACK/BYE）全部实测通过 |
@@ -190,7 +192,8 @@ tests/               单元 + 集成测试
 ## 已知边界
 
 - SIP 默认只监听 TCP；UDP 需显式开启（`sip.enable_udp`）。不支持 TLS（省内存的取舍）。
-- 每路通话消耗 2 个 RTP 端口，端口池见 `sip.rtp_ports`。
+- 每路**音频**通话消耗 2 个 RTP 端口；视频再各占 1 个（共 4 个/视频通话），端口池见 `sip.rtp_ports`。
+- 视频只做透传：双方必须协商到同一编码（如都用 H.264），网关不转码；不支持 EC20 侧视频。
 - 单腿只协商 PCMU/PCMA（8kHz），不支持 G.722/Opus 转码。
 - 群振最多 8 个分机，第一个 200 OK 胜出。
 - 本服务不碰路由/NAT 设置；EC20 的数据拨号（`quectel-CM`）与本项目互不影响，可同时使用。

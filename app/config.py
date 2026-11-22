@@ -33,6 +33,9 @@ DEFAULTS = {
         "udp_port_max": 40099,
         "register_expiry": 3600,
         "max_extensions": 64,
+        # relay video RTP between two extensions (no transcoding). EC20 has no
+        # video path, so calls to/from the modem stay audio-only.
+        "video": True,
         # always answer OPTIONS so monitoring tools see us
         "answer_options": True,
     },
