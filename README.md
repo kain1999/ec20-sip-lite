@@ -6,7 +6,7 @@
 
 ```
  SIP 话机 / 软电话 (Zoiper, MicroSIP, 亿联, 话机…)
-        │  REGISTER / INVITE / MESSAGE   (UDP 5060)
+        │  REGISTER / INVITE / MESSAGE   (TCP 5060)
         ▼
  ┌────────────────────────────── ec20-sip-lite ──────────────────────────────┐
  │  SIP 注册器 + B2BUA  ──►  媒体桥（20ms PCM / G.711）  ──►  EC20 USB 声卡     │
@@ -21,7 +21,7 @@
 
 | 模块 | 说明 |
 | --- | --- |
-| SIP 服务器 | UDP 注册器 + B2BUA；摘要认证（MD5）、NAT 友好（对称 RTP）、分机互打、分机拨外线、外线来电群振 |
+| SIP 服务器 | **TCP 注册器 + B2BUA**（默认，可开 UDP）；摘要认证（MD5）、对称 RTP、分机互打、拨外线、外线来电群振、振铃组 |
 | 分机管理 | Web 增删改查、随机密码、在线状态、踢下线、呼叫转移字段 |
 | EC20 驱动 | 纯 stdlib 的 termios AT 通道、URC 解析、`ATD/ATA/ATH/VTS`、`CMGR/CMGS` PDU 收发、`QPCMV` UAC 开关 |
 | 语音 | G.711 PCMU/PCMA 纯 Python 编解码，`arecord/aplay` 抓放 USB 音频，RFC2833 DTMF 双向 |
@@ -67,7 +67,8 @@ journalctl -u ec20-sip -n 50 | grep 管理面板
 ## 分机用法
 
 1. 面板「分机」页新增，例如 `1001`，密码可留空自动生成。
-2. 话机注册地址：`sip:1001@<盒子IP>`，端口 `5060`，UDP，认证用户名/密码同上。
+2. 话机注册地址：`sip:1001@<盒子IP>`，端口 `5060`，**传输选 TCP**（不支持 TCP 的老话机：把
+   `sip.enable_udp` 设成 `true` 后重启，它就能走 UDP，但只能呼出、不能被叫），认证用户名/密码同上。
 3. 互打：直接拨对方分机号。
 4. 拨外线：`9` + 手机号（前缀可在「设置 → 拨号」改），例：`913800138000`。
 5. 外线来电：所有在线分机同时振铃，第一个接听者接通，其余自动 CANCEL。
@@ -87,9 +88,8 @@ journalctl -u ec20-sip -n 50 | grep 管理面板
 {"sip": {"external_ip": "8.137.213.214", "rtp_ports": [10000, 10001, 10003, 10004]}}
 ```
 
-详见 [docs/FRP.md](docs/FRP.md)。注意 frp 的 UDP 反向隧道只支持"外部先发包"的方向：
-远程分机可以注册、呼入、通话音频双向，但**盒子主动呼叫远程分机不可用**
-（需要用 Tailscale/WireGuard，或改 SIP over TCP）。
+详见 [docs/FRP.md](docs/FRP.md)。SIP 走 TCP 隧道（一条隧道支持任意多台分机，服务端可沿连接
+反向呼出），RTP 走 udp 隧道（RTP 本身就是 UDP）。每路通话占 2 个 RTP 端口，4 个端口 = 2 路并发。
 
 ## 分机振铃组（一转多）
 
@@ -176,7 +176,8 @@ tests/               单元 + 集成测试
 
 ## 已知边界
 
-- 只做 UDP，不支持 SIP over TCP/TLS（省内存的取舍）。
+- SIP 默认只监听 TCP；UDP 需显式开启（`sip.enable_udp`）。不支持 TLS（省内存的取舍）。
+- 每路通话消耗 2 个 RTP 端口，端口池见 `sip.rtp_ports`。
 - 单腿只协商 PCMU/PCMA（8kHz），不支持 G.722/Opus 转码。
 - 群振最多 8 个分机，第一个 200 OK 胜出。
 - 本服务不碰路由/NAT 设置；EC20 的数据拨号（`quectel-CM`）与本项目互不影响，可同时使用。
