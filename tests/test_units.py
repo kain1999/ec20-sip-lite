@@ -184,5 +184,31 @@ class TestNotifyRules(unittest.TestCase):
         self.assertTrue(_matches({"match_type": "all", "pattern": ""}, {"text": "x"}))
 
 
+class TestMediaAddress(unittest.TestCase):
+    """SDP address selection: LAN peers get the LAN IP, tunnel peers the public IP."""
+
+    def test_loopback_means_tunnel(self):
+        from app.sip.server import SipServer
+
+        class Fake:
+            external_ip = "8.137.213.214"
+            local_ip = "192.168.1.188"
+            media_ip = "8.137.213.214"
+        fn = SipServer.media_ip_for
+        self.assertEqual(fn(Fake, "127.0.0.1"), "8.137.213.214")
+        self.assertEqual(fn(Fake, "192.168.1.50"), "192.168.1.188")
+        self.assertEqual(fn(Fake, "10.1.2.3"), "192.168.1.188")
+        self.assertEqual(fn(Fake, "203.0.113.9"), "8.137.213.214")
+
+    def test_no_external_ip(self):
+        from app.sip.server import SipServer
+
+        class Fake:
+            external_ip = ""
+            local_ip = "192.168.1.188"
+            media_ip = "192.168.1.188"
+        self.assertEqual(SipServer.media_ip_for(Fake, "192.168.1.50"), "192.168.1.188")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

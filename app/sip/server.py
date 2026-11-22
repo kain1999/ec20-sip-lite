@@ -676,6 +676,10 @@ class SipServer:
             return self.media_ip
         if self.local_ip == self.media_ip:
             return self.media_ip
+        if peer_ip in ("127.0.0.1", "::1", "localhost"):
+            # arrived over the frp/ssh tunnel: the far end is remote, so it must
+            # be told the public address or its RTP goes to an unreachable LAN IP
+            return self.media_ip
         if _is_private(peer_ip):
             return self.local_ip
         return self.media_ip
