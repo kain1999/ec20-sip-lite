@@ -24,6 +24,8 @@ async def main():
     parser.add_argument("--user", required=True)
     parser.add_argument("--password", required=True)
     parser.add_argument("--invite", default="")
+    parser.add_argument("--cancel-after", type=float, default=0.0,
+                        help="hang up while ringing after N seconds (sends CANCEL)")
     parser.add_argument("--hold", type=float, default=0.0,
                         help="after the call is up, wait N seconds for the server's BYE")
     parser.add_argument("--contact-host", default="0.0.0.0")
@@ -53,9 +55,10 @@ async def main():
             return 0
 
         call_id = "%s@probe" % secrets.token_hex(4)
+        ua_invite_branch = [branch()]
         from_header = "<sip:%s@%s>;tag=%s" % (args.user, host, secrets.token_hex(3))
         ua.send(sipmsg.build_request("INVITE", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
-            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (args.contact_host, ua.port, branch())),
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (args.contact_host, ua.port, ua_invite_branch[0])),
             ("Max-Forwards", "70"),
             ("From", from_header),
             ("To", "<sip:%s@%s>" % (args.invite, host)),
@@ -64,6 +67,32 @@ async def main():
             ("Content-Type", "application/sdp"),
         ], body=sdp.build_sdp(args.contact_host, 40000)))
         print("INVITE ->", args.invite)
+        invite_branch = ua_invite_branch[0]
+
+        if args.cancel_after > 0:
+            await asyncio.sleep(args.cancel_after)
+            print("  cancelling while ringing (CANCEL, same branch/CSeq)")
+            ua.send(sipmsg.build_request("CANCEL", "sip:%s@%s:%d" % (args.invite, host, port), headers=[
+                ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (args.contact_host, ua.port, invite_branch)),
+                ("Max-Forwards", "70"),
+                ("From", from_header),
+                ("To", "<sip:%s@%s>" % (args.invite, host)),
+                ("Call-ID", call_id), ("CSeq", "1 CANCEL"),
+            ]))
+            for _ in range(8):
+                try:
+                    message = await ua.recv(timeout=3)
+                except asyncio.TimeoutError:
+                    print("  (no more messages)")
+                    break
+                if message.is_request:
+                    print("  <- request", message.method, "| From:", (message.get("From") or "")[:45],
+                          "| To:", (message.get("To") or "")[:30], "| Via:", (message.get("Via") or "")[:38])
+                    continue
+                print("  <-", message.status, message.reason, "| CSeq:", message.get("CSeq"))
+                if message.status == 487:
+                    break
+            return 0
 
         final = None
         for _ in range(8):

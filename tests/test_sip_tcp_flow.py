@@ -398,6 +398,107 @@ class SipTcpFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(final, "caller must be told the call failed")
         self.assertIn(final.status, (480, 486, 487))
 
+    async def test_caller_cancel_stops_callee_ringing(self):
+        """CANCEL must stop the callee, and must reuse the INVITE's branch/CSeq."""
+        await self.register(self.c1, "1001", "pass1")
+        await self.register(self.c2, "1002", "pass2")
+        call_id = "cxl-%s" % secrets.token_hex(4)
+        from_header = "<sip:1001@%s>;tag=%s" % (IP, secrets.token_hex(3))
+        c1_branch = branch()
+        self.c1.send(sipmsg.build_request(
+            "INVITE", "sip:1002@%s:%d" % (IP, self.port), headers=[
+                ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (IP, self.port, c1_branch)),
+                ("Max-Forwards", "70"),
+                ("From", from_header),
+                ("To", "<sip:1002@%s>" % IP),
+                ("Call-ID", call_id), ("CSeq", "1 INVITE"),
+                ("Contact", "<sip:1001@%s:%d;transport=tcp>" % (IP, self.c1.port)),
+                ("Content-Type", "application/sdp"),
+            ], body=sdp.build_sdp(IP, 41000)))
+        await self.c1.recv()                       # 100 Trying
+        callee_invite = await self.c2.recv()       # INVITE towards 1002
+        to_tag = secrets.token_hex(3)
+        self.c2.send(sipmsg.build_response(callee_invite, 180, "Ringing", to_tag=to_tag))
+        await self.c1.recv()                       # 180 towards caller
+
+        # caller cancels while ringing (same branch + CSeq number as its INVITE)
+        self.c1.send(sipmsg.build_request(
+            "CANCEL", "sip:1002@%s:%d" % (IP, self.port), headers=[
+                ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (IP, self.port, c1_branch)),
+                ("Max-Forwards", "70"),
+                ("From", from_header),
+                ("To", "<sip:1002@%s>" % IP),
+                ("Call-ID", call_id), ("CSeq", "1 CANCEL"),
+            ]))
+
+        cancel_at_callee = await self.c2.recv(timeout=6)
+        self.assertEqual(cancel_at_callee.method, "CANCEL",
+                         "callee must be cancelled, not left ringing")
+        inv_via = sipmsg.param_of(callee_invite.get("Via"), "branch")
+        cxl_via = sipmsg.param_of(cancel_at_callee.get("Via"), "branch")
+        self.assertEqual(inv_via, cxl_via, "CANCEL must reuse the INVITE branch")
+        self.assertEqual(callee_invite.get("CSeq").split()[0],
+                         cancel_at_callee.get("CSeq").split()[0],
+                         "CANCEL must reuse the INVITE CSeq number")
+
+    async def test_caller_not_rung_in_own_group(self):
+        """1001 calling 1002 must not ring 1001 itself (shared ring group)."""
+        self.db.update_extension(self.db.get_extension("1001")["id"], ring_group="1001&1002")
+        self.db.update_extension(self.db.get_extension("1002")["id"], ring_group="1001&1002")
+        await self.register(self.c1, "1001", "pass1")
+        await self.register(self.c2, "1002", "pass2")
+        call_id = "self-%s" % secrets.token_hex(4)
+        self.c1.send(self.build("INVITE", "1001", call_id, 1, to_user="1002",
+                                body=sdp.build_sdp(IP, 41000),
+                                extra=[("Content-Type", "application/sdp")]))
+        await self.c1.recv()                       # 100 Trying
+        callee_invite = await self.c2.recv()       # 1002 rings - correct
+        self.assertEqual(callee_invite.method, "INVITE")
+
+        # the caller must NOT receive an INVITE of its own, ever
+        got_invite = False
+        while True:
+            try:
+                message = await self.c1.recv(timeout=1.0)
+            except asyncio.TimeoutError:
+                break
+            if message.is_request and message.method == "INVITE":
+                got_invite = True
+        self.assertFalse(got_invite, "the caller must not ring in its own group")
+
+    async def test_cancel_reuses_invite_branch_and_cseq(self):
+        """The CANCEL we emit must match the INVITE it cancels (RFC 3261 9.1)."""
+        await self.register(self.c1, "1001", "pass1")
+        await self.register(self.c2, "1002", "pass2")
+        call_id = "cxl2-%s" % secrets.token_hex(4)
+        from_header = "<sip:1001@%s>;tag=%s" % (IP, secrets.token_hex(3))
+        c1_branch = branch()
+        self.c1.send(sipmsg.build_request(
+            "INVITE", "sip:1002@%s:%d" % (IP, self.port), headers=[
+                ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (IP, self.port, c1_branch)),
+                ("From", from_header), ("To", "<sip:1002@%s>" % IP),
+                ("Call-ID", call_id), ("CSeq", "1 INVITE"),
+                ("Contact", "<sip:1001@%s:%d>" % (IP, self.c1.port)),
+                ("Content-Type", "application/sdp"),
+            ], body=sdp.build_sdp(IP, 41000)))
+        await self.c1.recv()
+        callee_invite = await self.c2.recv()
+        self.c2.send(sipmsg.build_response(callee_invite, 180, "Ringing",
+                                           to_tag=secrets.token_hex(3)))
+        await self.c1.recv()
+        self.c1.send(sipmsg.build_request(
+            "CANCEL", "sip:1002@%s:%d" % (IP, self.port), headers=[
+                ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (IP, self.port, c1_branch)),
+                ("From", from_header), ("To", "<sip:1002@%s>" % IP),
+                ("Call-ID", call_id), ("CSeq", "1 CANCEL"),
+            ]))
+        cancel = await self.c2.recv(timeout=6)
+        self.assertEqual(cancel.method, "CANCEL")
+        self.assertEqual(sipmsg.param_of(callee_invite.get("Via"), "branch"),
+                         sipmsg.param_of(cancel.get("Via"), "branch"))
+        self.assertEqual(callee_invite.get("CSeq").split()[0],
+                         cancel.get("CSeq").split()[0])
+
     async def test_extension_to_extension_call(self):
         await self.register(self.c1, "1001", "pass1")
         await self.register(self.c2, "1002", "pass2")

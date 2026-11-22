@@ -282,6 +282,15 @@ class SipCall:
         self.end("bye")
 
     def on_leg_cancel(self, leg):
+        # the caller gave up while we were still dialling: drop every other leg,
+        # and the EC20 side too when this was an outside call
+        if self.modem_id is not None and self.modem_id != "pending":
+            self.manager.server.loop.create_task(self.manager.modem_hangup())
+        for other in self.ring_legs:
+            if other.state in ("inviting", "ringing-remote"):
+                other.cancel()
+        if self.leg_b is not None and self.leg_b.state in ("inviting", "ringing-remote"):
+            self.leg_b.cancel()
         self.end("cancel")
 
     def on_dtmf(self, leg, digit):
@@ -434,7 +443,16 @@ class CallManager:
         await self._call_modem(call, number)
 
     async def _call_group(self, call, numbers):
-        """Ring several extensions at once; the first answer wins, rest cancel."""
+        """Ring several extensions at once; the first answer wins, rest cancel.
+
+        The caller is never part of its own ring group: calling 1002 from 1001
+        must not make 1001 ring as well (the caller would hear itself).
+        """
+        numbers = [n for n in numbers if n != call.from_user]
+        if not numbers:
+            call.leg_a.reject(486, "Busy Here")
+            call.end("only caller in group")
+            return
         call.to_user = "&".join(numbers)
         call.ring_legs = []
         for number in numbers:

@@ -148,6 +148,7 @@ class SipLeg:
             LOG.exception("bye handler failed")
 
     def on_cancel(self, message):
+        LOG.info("CANCEL for %s from %s, replying 200 + 487", self.call_id, self.remote_target)
         self.server.send_message(sipmsg.build_response(message, 200, "OK", to_tag=self.local_tag),
                                  self.remote_target)
         if self.invite_msg:
@@ -175,8 +176,10 @@ class SipLeg:
                        if not display or display == from_user
                        else "\"%s\" <sip:%s@%s>;tag=%s" % (display, from_user,
                                                            self.advert_ip, self.local_tag))
+        invite_branch = branch()
+        self.invite_branch = invite_branch
         request = sipmsg.build_request("INVITE", uri, headers=[
-            ("Via", "SIP/2.0/TCP %s:%d;branch=%s;rport" % (self.advert_ip, self.server.port, branch())),
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s;rport" % (self.advert_ip, self.server.port, invite_branch)),
             ("Max-Forwards", "70"),
             ("From", from_header),
             ("To", "<sip:%s@%s>" % (target_user, host)),
@@ -189,6 +192,12 @@ class SipLeg:
             ("Content-Type", "application/sdp"),
         ], body=body)
         self.pending_request = request
+        # register the dialog *before* sending: a very fast 100/180 would
+        # otherwise arrive before the caller had put us in the leg table, and
+        # the INVITE retransmissions would never stop
+        self.server.legs[self.call_id] = self
+        LOG.info("INVITE %s -> %s via %s (branch %s)", target_user,
+                 "%s:%d" % (host, port), self.remote_target, self.invite_branch[:12])
         self.server.send_message(request, self.remote_target)
         self._schedule_invite_retransmit()
         return True
@@ -205,6 +214,11 @@ class SipLeg:
 
     def on_response(self, message):
         status = message.status or 0
+        if self._retransmit_task:
+            # SIP over TCP does not need INVITE retransmission once the peer
+            # answered with anything (1xx..6xx); keeping it re-rings the phone
+            self._retransmit_task.cancel()
+            self._retransmit_task = None
         if status < 200:
             if self.remote_tag == "":
                 self.remote_tag = sipmsg.tag_of(message.get("To"))
@@ -333,16 +347,28 @@ class SipLeg:
         self._retransmit_task = task
 
     def cancel(self):
+        """Cancel a pending INVITE.
+
+        RFC 3261 9.1: the CANCEL must carry the *same* Via branch, From tag and
+        CSeq sequence number as the INVITE it cancels. Phones silently ignore a
+        CANCEL that does not match, which left the callee ringing forever.
+        """
         if not self.pending_request:
             return
-        self.local_cseq += 1
+        if self.state not in ("inviting", "ringing-remote"):
+            # already answered: tearing down needs BYE, not CANCEL
+            if self.state in ("answered", "answered-acked"):
+                self.send_bye()
+            return
+        invite_cseq = (self.pending_request.cseq or "").split()[0] or str(self.local_cseq)
         cancel = sipmsg.build_request("CANCEL", self.pending_request.uri, headers=[
-            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (self.advert_ip, self.server.port, branch())),
+            ("Via", "SIP/2.0/TCP %s:%d;branch=%s" % (self.advert_ip, self.server.port,
+                                                     self.invite_branch or branch())),
             ("Max-Forwards", "70"),
             ("From", self.pending_request.get("From")),
             ("To", self.pending_request.get("To")),
             ("Call-ID", self.call_id),
-            ("CSeq", "%d CANCEL" % self.local_cseq),
+            ("CSeq", "%s CANCEL" % invite_cseq),
             ("Content-Length", "0"),
         ])
         self.server.send_message(cancel, self.remote_target)

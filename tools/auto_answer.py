@@ -25,6 +25,8 @@ async def main():
     parser.add_argument("--user", required=True)
     parser.add_argument("--password", required=True)
     parser.add_argument("--hold", type=float, default=8.0)
+    parser.add_argument("--ring-only", action="store_true",
+                        help="reply 180 and keep ringing; report a CANCEL instead of answering")
     parser.add_argument("--contact-host", default="0.0.0.0")
     args = parser.parse_args()
 
@@ -46,6 +48,28 @@ async def main():
                 invite = message
         peer_sdp = sdp.parse_sdp(invite.body)
         print("INVITE from", invite.get("From"), "sdp:", peer_sdp, flush=True)
+
+        if args.ring_only:
+            to_tag = secrets.token_hex(3)
+            ua.send(sipmsg.build_response(invite, 180, "Ringing", to_tag=to_tag))
+            print("180 Ringing sent, waiting for CANCEL/BYE...", flush=True)
+            while True:
+                message = await ua.recv(timeout=180)
+                if not message.is_request:
+                    print("  <-", message.status, message.reason, flush=True)
+                    continue
+                print("  <- request", message.method, flush=True)
+                if message.method == "CANCEL":
+                    ua.send(sipmsg.build_response(message, 200, "OK"))
+                    ua.send(sipmsg.build_response(invite, 487, "Request Terminated", to_tag=to_tag))
+                    print("CANCEL received: stopped ringing  [OK]", flush=True)
+                    return 0
+                if message.method == "ACK":
+                    print("BUG: got ACK while we only rang", flush=True)
+                if message.method == "BYE":
+                    ua.send(sipmsg.build_response(message, 200, "OK"))
+                    print("BYE received while ringing", flush=True)
+                    return 0
 
         ua.send(sipmsg.build_response(invite, 200, "OK", headers=[
             ("Contact", "<sip:%s@%s:%d;transport=tcp>" % (args.user, args.contact_host, ua.port)),
