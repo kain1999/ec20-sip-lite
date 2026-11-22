@@ -1,5 +1,18 @@
 # ec20-sip-lite
 
+[![ci](https://github.com/kain1999/ec20-sip-lite/actions/workflows/ci.yml/badge.svg)](https://github.com/kain1999/ec20-sip-lite/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/kain1999/ec20-sip-lite?label=release)](https://github.com/kain1999/ec20-sip-lite/releases)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
+
+克隆与安装：
+
+```sh
+git clone https://github.com/kain1999/ec20-sip-lite.git
+cd ec20-sip-lite
+sudo sh install.sh            # 装到 /opt/ec20-sip-lite，注册 systemd 服务
+```
+
 极低内存的 **SIP 服务器 + Quectel EC20 4G 模块网关**，为 hi3798mv300（hinas / 海纳思）这类
 **可用内存不到 500MB** 的盒子上跑而写。单进程 Python 3（仅标准库），实测常驻 **13–23MB**，
 不装 Docker、不装 Asterisk、不装 Kamailio、不装 pjsip。
